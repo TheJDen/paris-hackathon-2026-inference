@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Egg info
+*.egg-info
+
+# Results (generated, not committed)
+results/
+
+# Raw lm-eval output (large, keep only summary JSONs)
+baseline/results/correctness_raw/
+
+# Prompts (generated but committed)
+# eval/throughput/prompts.json
