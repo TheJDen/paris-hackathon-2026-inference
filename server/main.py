@@ -85,6 +85,17 @@ def parse_args() -> argparse.Namespace:
         "debugging). First call per bucket pays ~1-3s capture cost; subsequent "
         "calls replay the graph with near-zero CPU dispatch overhead.",
     )
+    p.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="wrap the inner transformer model with torch.compile (Inductor, "
+        "reduce-overhead mode). Fuses RMSNorm/SiLU/elementwise ops; expects a "
+        "30-90s compile cost on first warm-up before the server takes traffic. "
+        "Use --no-torch-compile to fall back to eager (default: on). "
+        "NOTE: when --torch-compile is on, --cuda-graphs is automatically "
+        "disabled to avoid conflict (reduce-overhead owns CUDA graphs internally).",
+    )
     return p.parse_args()
 
 
@@ -112,6 +123,7 @@ def main() -> None:
         profile_torch_min_batch_size=args.profile_torch_min_batch_size,
         profile_torch_tag=args.profile_tag,
         enable_cuda_graphs=args.cuda_graphs,
+        torch_compile=args.torch_compile,
     )
 
     if args.metrics_interval > 0:
