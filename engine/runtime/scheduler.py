@@ -130,47 +130,16 @@ class Scheduler:
 
             if should_prefill:
                 with time_region("scheduler.admit_prefill"):
-                    # Admit up to max_prefill_batch sequences in one step,
-                    # all from the same length bucket to minimise padding waste.
-                    #
-                    # Bucket scheme: ceil-to-next-multiple-of-128.
-                    #   bucket(L) = ((L + 127) // 128) * 128
-                    # Within one prefill call all sequences share a bucket, so
-                    # padding waste is at most 127 tokens per sequence (< 12%
-                    # for 1024-token prompts) vs unbounded under pure FIFO.
-                    #
-                    # Fairness: we pick the bucket that contains the OLDEST
-                    # waiting sequence (by enqueued_at). No request starves
-                    # because the longest-waiting sequence always determines
-                    # which bucket fires next.
-                    def _bucket(seq: Sequence) -> int:
-                        return ((seq.prompt_len + 127) // 128) * 128
-
-                    # Snapshot the waiting list (cheap — at most a few hundred
-                    # entries in practice; the FIFO order is preserved below).
-                    waiting_list = list(self.waiting)
-
-                    # Find the oldest sequence and pin the target bucket.
-                    oldest = min(waiting_list, key=lambda s: s.enqueued_at)
-                    target_bucket = _bucket(oldest)
-
-                    # Collect up to max_prefill_batch sequences that fall in
-                    # the target bucket, preserving their relative FIFO order.
-                    # Sequences that don't fit stay in waiting unchanged.
+                    # Length bucketing DISABLED — small length variance was
+                    # splitting sequences across buckets and starving the batch.
+                    # Simple FIFO admit: take up to max_prefill_batch from the
+                    # head of the waiting queue.
                     batch_seqs: list[Sequence] = []
-                    remaining: list[Sequence] = []
                     max_admit = min(self.config.max_prefill_batch, len(self.free_slots))
-                    for seq in waiting_list:
-                        if (
-                            len(batch_seqs) < max_admit
-                            and _bucket(seq) == target_bucket
-                        ):
-                            batch_seqs.append(seq)
-                        else:
-                            remaining.append(seq)
-
-                    # Rebuild the waiting deque from whatever we didn't admit.
-                    self.waiting = collections.deque(remaining)
+                    for _ in range(max_admit):
+                        if not self.waiting:
+                            break
+                        batch_seqs.append(self.waiting.popleft())
 
                     prefill_t0 = time.perf_counter()
                     for seq in batch_seqs:
