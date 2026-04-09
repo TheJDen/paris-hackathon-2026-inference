@@ -21,12 +21,17 @@ baseline/results/correctness_raw/
 # Prompts (generated but committed)
 # eval/throughput/prompts.json
 
-# Profiling artifacts (keep README + small summary jsons; drop chrome traces & raw)
+# Profiling artifacts
+# Keep: README, summary jsons, throughput sweep results, AND torch chrome
+# traces so teammates can grab them directly from GitHub instead of scp'ing
+# from the server. Chrome traces are 20-30 MB each — well under GitHub's
+# 100 MB per-file limit but they DO add up over time. If repo size becomes
+# a problem, prune old traces or move them to git-lfs.
 profiles/*
 !profiles/README.md
 !profiles/*.summary.json
-# Throughput sweep artifacts are also tiny and useful to commit alongside STATUS.md.
 !profiles/throughput_*.json
+!profiles/torch_*.json.gz
 
 # Server runtime artifacts
 server.log

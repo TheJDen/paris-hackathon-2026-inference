@@ -55,13 +55,24 @@ Per-level tok/s, partial weighted score, configuration. Consumed by
 `bench/refresh_status.py` to render the throughput table in
 `STATUS.md`.
 
-## What's gitignored
+## What's committed vs gitignored
 
-- Raw chrome traces (`*.json.gz`) — too big for git, share via
-  artifact storage or ask a teammate to capture locally.
-- Other large nsys/ncu reports.
-
-What's **kept**:
+**Committed** (so teammates can grab them from GitHub without ssh):
 - This README
+- All `torch_*.json.gz` chrome traces (~20-30 MB each, drop into Perfetto)
 - All `*.summary.json` (small, drives STATUS.md across commits)
-- All `throughput_*.json` (also small)
+- All `throughput_*.json` (per-run sweep results)
+
+**Gitignored**:
+- Other large captures (nsys `.nsys-rep`, ncu `.ncu-rep`)
+- Anything else under `profiles/`
+
+If repo size becomes a problem (50+ pushes × 25 MB ≈ 1.25 GB), prune
+old traces with `git filter-repo` or move them to git-lfs.
+
+## How to grab a profile from GitHub
+
+From the GitHub UI: navigate to the file under `profiles/`, hit
+**Download**. The chrome trace lands locally as `.json.gz`. Drop the
+.gz directly into [Perfetto](https://ui.perfetto.dev) — it understands
+gzip natively.
