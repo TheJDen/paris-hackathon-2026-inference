@@ -1,28 +1,29 @@
 """Top-level Engine.
 
-Phase 0: a stub Engine that does NOT load weights — it returns canned text
-so we can verify the server, OpenAI shape, chat template, and metrics
-plumbing on the laptop without a GPU.
+Phase 2a: continuous batching, no `model.generate`.
 
-Phase 1 (current): real generate via HuggingFace `Qwen3_5MoeForCausalLM` with
-**static microbatching**. A background batcher coroutine drains a request
-queue, gathers up to `max_batch` requests within `batch_window_s`, left-pads
-them to a common length, and runs one batched `model.generate(...)` call.
-Per-request futures are resolved as the batch completes. The asyncio.Lock
-of the prior version is gone — concurrent FastAPI handlers actually batch
-through one model forward.
+The engine bridges the asyncio FastAPI handlers and a synchronous
+single-threaded scheduler that drives `runner.prefill` / `runner.decode`
+on a slot-pool KV cache. HuggingFace `transformers` is used **only** as
+a weight loader and an `nn.Module` library — `model.generate()` is gone,
+HF's `DynamicCache` is gone, HF's left-padded batched generate is gone.
 
-Limitations of this Phase 1 batcher (all addressed in Phase 2):
-- Static (not in-flight) batching: a batch is locked when generation starts;
-  late arrivals wait for the next batch.
-- Generation length is `max(max_tokens)` across the batch — short outputs
-  pay for the longest one. Mitigated by trimming each output at first EOS
-  before returning.
-- Uses HF's KV cache, not a paged cache. Memory ceiling will be the limit.
-- TP=1: all batching happens on one GPU.
+Lifecycle:
 
-The `Engine.generate(...)` interface is the stable boundary the FastAPI
-server depends on; later phases swap out the internals without touching it.
+  1. `Engine.build(...)` loads the HF model + builds the ModelRunner +
+     Scheduler.
+  2. `Engine.start()` spawns a single dedicated thread (`_engine_executor`,
+     1 worker) and runs the scheduler's drain loop on it forever.
+  3. `Engine.generate(...)` wraps the user request as a Sequence, drops
+     it on the scheduler's waiting queue, and awaits the Sequence's
+     future. The scheduler resolves the future when the sequence
+     finishes.
+
+The single-thread executor is what makes torch.profiler happy across
+batches (CUPTI binds callbacks to the thread that first imports them).
+It also avoids any cross-thread torch nonsense in the model forward.
+
+Phase 0 stub mode is preserved for laptop API smoke tests.
 """
 
 from __future__ import annotations
@@ -30,17 +31,27 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 from typing import Literal
 
 from engine.runtime.metrics import metrics
 from engine.runtime.profiling import (
+    annotate_hf_model_for_profiling,
+    enable_torch_profiler,
     export_torch_profile,
     time_region,
     torch_profiler_enabled,
     torch_profiler_tag,
+)
+from engine.runtime.scheduler import Scheduler, SchedulerConfig
+from engine.runtime.sequence import (
+    GenerationResult,
+    SamplingParams,
+    Sequence,
+    SequenceStatus,
+    make_request_id,
 )
 from engine.tokenizer.chat_template import ChatTokenizer, THINK_OPEN
 
@@ -49,26 +60,6 @@ log = logging.getLogger(__name__)
 
 
 FinishReason = Literal["stop", "length"]
-
-
-@dataclass
-class GenerationResult:
-    text: str
-    prompt_tokens: int
-    completion_tokens: int
-    finish_reason: FinishReason
-
-
-@dataclass
-class _BatchRequest:
-    """One in-flight request waiting in the batcher queue."""
-
-    messages: list[dict[str, str]]
-    max_tokens: int
-    temperature: float
-    top_p: float
-    future: "asyncio.Future[GenerationResult]"
-    enqueued_at: float = field(default_factory=time.perf_counter)
 
 
 class Engine:
@@ -89,7 +80,7 @@ class Engine:
         max_model_len: int = 4096,
         device: str = "cuda:0",
         attn_impl: str = "sdpa",
-        batch_window_ms: float = 5.0,
+        batch_window_ms: float = 5.0,  # legacy CLI arg, ignored by Phase 2a
         profile_torch_after_batches: int = 0,
         profile_torch_min_batch_size: int = 1,
         profile_torch_tag: str = "run",
@@ -101,31 +92,28 @@ class Engine:
         self.max_model_len = max_model_len
         self.device = device
         self.attn_impl = attn_impl
-        self.batch_window_s = batch_window_ms / 1000.0
 
         # One-shot torch.profiler capture: skip the first N batches as
-        # warmup, then capture the FIRST batch after that whose size is at
-        # least `profile_torch_min_batch_size`. The min-size predicate
-        # avoids accidentally capturing a level's 2-request warmup batch
-        # instead of a meaningful steady-state main batch.
+        # warmup, then capture the FIRST batch (decode step) after that
+        # whose batch size is at least `profile_torch_min_batch_size`.
         self._profile_after_batches = int(profile_torch_after_batches)
         self._profile_min_batch_size = max(1, int(profile_torch_min_batch_size))
         self._profile_tag = str(profile_torch_tag)
         self._profile_done = False
-        self._batch_index = 0
+        self._batch_index = 0  # incremented per decode step
 
         self.tokenizer: ChatTokenizer | None = None
-        self._loaded = None  # LoadedModel from engine.model.qwen3_next
-        self._req_queue: asyncio.Queue[_BatchRequest] | None = None
-        self._batcher_task: asyncio.Task | None = None
+        self.runner = None
+        self.scheduler: Scheduler | None = None
 
-        # Pin all model.generate calls to a single dedicated thread.
-        # asyncio.to_thread uses a multi-worker pool which trips
-        # torch.profiler's CUPTI thread-affinity check
-        # ("External init callback must run in same thread as
-        # registerClient"). One executor + one worker = same thread for
-        # every batch.
+        # Single-thread executor so torch.profiler thread-affinity holds.
         self._gen_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+        # Cross-thread wakeup for the scheduler drain loop.
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._drain_future: concurrent.futures.Future | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         if not stub:
             self.tokenizer = ChatTokenizer(model_name)
@@ -147,39 +135,65 @@ class Engine:
         return eng
 
     def _load(self) -> None:
-        """Heavy load of the HF reference model. Phase 1: TP=1 only."""
+        """Heavy load: HF model + slot-pool runner + scheduler."""
         from engine.model.qwen3_next import load_model
+        from engine.runtime.model_runner import ModelRunner
 
         with time_region("engine.load_model"):
-            self._loaded = load_model(
+            loaded = load_model(
                 self.model_name,
                 device=self.device,
                 attn_impl=self.attn_impl,
             )
-        # Make sure padding works for batched generate. Many tokenizers leave
-        # pad_token unset; HF generate then refuses to batch.
-        tok = self._loaded.tokenizer
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
-        # Left padding is required for HF generate (so the right edge of every
-        # row is the position the model is decoding from).
-        tok.padding_side = "left"
+        self._loaded = loaded
+
+        # If profiling is armed, install the per-layer record_function
+        # hooks BEFORE the first forward so the chrome trace is readable.
+        if torch_profiler_enabled() or self._profile_after_batches > 0:
+            n = annotate_hf_model_for_profiling(loaded.model)
+            log.info("installed %d profile hooks on HF model layers", n)
+
+        with time_region("engine.build_runner"):
+            self.runner = ModelRunner(
+                hf_model=loaded.model,
+                text_config=loaded.text_config,
+                device=loaded.device,
+                num_slots=self.max_batch,
+                max_seq_len=self.max_model_len,
+            )
+            log.info(
+                "model runner ready: cache_mem=%.2f GB", self.runner.cache_memory_gb()
+            )
+
+        self.scheduler = Scheduler(
+            runner=self.runner,
+            config=SchedulerConfig(
+                num_slots=self.max_batch,
+                max_seq_len=self.max_model_len,
+                max_decode_batch=self.max_batch,
+            ),
+        )
 
     async def start(self) -> None:
-        """Spawn the background batcher coroutine. Idempotent."""
-        if self.stub or self._batcher_task is not None:
+        """Spawn the dedicated engine thread + drain loop. Idempotent."""
+        if self.stub or self._drain_future is not None:
             return
-        self._req_queue = asyncio.Queue()
-        self._batcher_task = asyncio.create_task(self._batcher_loop(), name="engine-batcher")
+        assert self._gen_executor is not None
+        self._loop = asyncio.get_event_loop()
+        self._drain_future = self._gen_executor.submit(self._drain_blocking)
 
     async def stop(self) -> None:
-        if self._batcher_task is not None:
-            self._batcher_task.cancel()
+        if self._drain_future is not None:
+            self._stop_event.set()
+            self._wake_event.set()
             try:
-                await self._batcher_task
-            except (asyncio.CancelledError, Exception):
+                # Don't block forever — the drain loop checks stop every step
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self._drain_future.result, 5.0
+                )
+            except (concurrent.futures.TimeoutError, Exception):
                 pass
-            self._batcher_task = None
+            self._drain_future = None
         if self._gen_executor is not None:
             self._gen_executor.shutdown(wait=False)
             self._gen_executor = None
@@ -191,7 +205,7 @@ class Engine:
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> GenerationResult:
-        """Submit a generation request and await the result."""
+        """Submit a request and await its result."""
         t0 = time.perf_counter()
         success = False
         result: GenerationResult | None = None
@@ -199,20 +213,22 @@ class Engine:
             with time_region("engine.generate"):
                 if self.stub:
                     result = self._stub_generate(messages, max_tokens)
-                else:
-                    if self._req_queue is None:
-                        await self.start()
-                    assert self._req_queue is not None
-                    fut: asyncio.Future[GenerationResult] = asyncio.get_event_loop().create_future()
-                    req = _BatchRequest(
-                        messages=messages,
-                        max_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        top_p=float(top_p),
-                        future=fut,
-                    )
-                    await self._req_queue.put(req)
-                    result = await fut
+                    success = True
+                    return result
+
+                # Make sure the drain loop is running.
+                if self._drain_future is None:
+                    await self.start()
+
+                seq = await self._build_sequence(
+                    messages, max_tokens, temperature, top_p
+                )
+                self.scheduler.add_request(seq)
+                self._wake_event.set()
+
+                # Await the future; the scheduler resolves it from the
+                # engine thread.
+                result = await seq.future
             success = True
             return result
         finally:
@@ -224,285 +240,120 @@ class Engine:
             )
 
     # ------------------------------------------------------------------ #
-    # static microbatching
+    # request building
     # ------------------------------------------------------------------ #
 
-    async def _batcher_loop(self) -> None:
-        """Drain the request queue and run batched generates."""
-        assert self._req_queue is not None
-        log.info(
-            "batcher loop started: max_batch=%d window_ms=%.1f",
-            self.max_batch, self.batch_window_s * 1000,
+    async def _build_sequence(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> Sequence:
+        assert self.tokenizer is not None
+        with time_region("engine.render_prompt"):
+            prompt_text = self.tokenizer.render_prompt(messages)
+        with time_region("engine.encode_prompt"):
+            prompt_token_ids = self._loaded.tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0].tolist()
+
+        eos_ids = []
+        eos = self._loaded.tokenizer.eos_token_id
+        if isinstance(eos, list):
+            eos_ids.extend(int(x) for x in eos)
+        elif eos is not None:
+            eos_ids.append(int(eos))
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[GenerationResult] = loop.create_future()
+
+        seq = Sequence(
+            request_id=make_request_id(),
+            prompt_token_ids=prompt_token_ids,
+            sampling=SamplingParams(
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                top_p=float(top_p),
+                eos_token_ids=tuple(eos_ids),
+            ),
+            future=future,
         )
+        # Stash a reference to the loop on the seq so the engine thread
+        # can resolve futures via call_soon_threadsafe.
+        seq._loop = loop  # type: ignore[attr-defined]
+        seq._engine_self = self  # type: ignore[attr-defined]
+        return seq
+
+    # ------------------------------------------------------------------ #
+    # engine thread — scheduler drain loop
+    # ------------------------------------------------------------------ #
+
+    def _drain_blocking(self) -> None:
+        """Run on the dedicated engine thread. Drives the scheduler."""
+        log.info("engine drain loop started")
         try:
-            while True:
-                first = await self._req_queue.get()
-                batch: list[_BatchRequest] = [first]
-                deadline = time.monotonic() + self.batch_window_s
-                while len(batch) < self.max_batch:
-                    timeout = max(0.0, deadline - time.monotonic())
-                    if timeout == 0.0:
-                        break
-                    try:
-                        nxt = await asyncio.wait_for(self._req_queue.get(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        break
-                    batch.append(nxt)
+            while not self._stop_event.is_set():
+                if not self.scheduler.has_work():
+                    # Sleep until a request comes in (or stop).
+                    self._wake_event.wait(timeout=0.1)
+                    self._wake_event.clear()
+                    continue
 
-                # Greedy and sampled requests can't share a batch — split.
-                greedy = [r for r in batch if r.temperature <= 0.0]
-                sampled = [r for r in batch if r.temperature > 0.0]
-                # Process greedy first (typical case for the eval), then sampled.
-                if greedy:
-                    await self._process_batch(greedy, do_sample=False)
-                if sampled:
-                    await self._process_batch(sampled, do_sample=True)
-        except asyncio.CancelledError:
-            log.info("batcher loop cancelled")
-            raise
+                # Step. Returns finished sequences.
+                finished = self.scheduler.step()
+                self._batch_index += 1
+
+                # Resolve futures for finished sequences.
+                if finished:
+                    for seq in finished:
+                        self._resolve(seq)
         except Exception as e:
-            log.exception("batcher loop crashed: %s", e)
-            raise
-
-    async def _process_batch(self, batch: list[_BatchRequest], do_sample: bool) -> None:
-        """Tokenize, pad, run one batched HF generate, route results back."""
-        assert self._loaded is not None and self.tokenizer is not None
-        loaded = self._loaded
-        tok = loaded.tokenizer
-        n = len(batch)
-
-        try:
-            with time_region("engine.batch.render"):
-                rendered = [self.tokenizer.render_prompt(r.messages) for r in batch]
-
-            with time_region("engine.batch.tokenize"):
-                # left-padded batch tensor + attention_mask
-                enc = tok(
-                    rendered,
-                    return_tensors="pt",
-                    padding=True,
-                    add_special_tokens=False,
-                )
-                input_ids = enc["input_ids"].to(loaded.device)
-                attention_mask = enc["attention_mask"].to(loaded.device)
-
-            # Per-request prompt length = number of non-pad tokens on each row.
-            prompt_lens = attention_mask.sum(dim=-1).tolist()
-            # Batch generation length = the largest requested max_tokens.
-            max_new = max(r.max_tokens for r in batch)
-            padded_prompt_len = int(input_ids.shape[-1])
-
-            gen_kwargs: dict[str, object] = {
-                "max_new_tokens": int(max_new),
-                "do_sample": do_sample,
-                "pad_token_id": tok.pad_token_id,
-                "eos_token_id": tok.eos_token_id,
-            }
-            if do_sample:
-                # All sampled requests in a batch share the first request's
-                # temperature/top_p — Phase 1 doesn't try to mix sampling
-                # configs in one batch. The eval uses temperature=0 anyway.
-                gen_kwargs["temperature"] = float(batch[0].temperature)
-                gen_kwargs["top_p"] = float(batch[0].top_p)
-
-            metrics.record_batch(
-                running=n,
-                waiting=self._req_queue.qsize() if self._req_queue else 0,
-                batch_size=n,
-            )
-
-            t0 = time.perf_counter()
-            assert self._gen_executor is not None
-            output_ids = await asyncio.get_running_loop().run_in_executor(
-                self._gen_executor,
-                self._generate_blocking,
-                input_ids,
-                attention_mask,
-                gen_kwargs,
-            )
-            wall_s = time.perf_counter() - t0
-            metrics.record_step(wall_s, kind="prefill")
-
-            # Slice each row's continuation, trim at first EOS, decode.
-            with time_region("engine.batch.decode"):
-                eos_id = tok.eos_token_id
-                pad_id = tok.pad_token_id
-                # eos_token_id may be a list (multi-eos models). Build a set.
-                if isinstance(eos_id, (list, tuple)):
-                    eos_ids = set(int(x) for x in eos_id)
-                else:
-                    eos_ids = {int(eos_id)} if eos_id is not None else set()
-                eos_ids.add(int(pad_id))
-
-                results: list[GenerationResult] = []
-                for i, req in enumerate(batch):
-                    cont = output_ids[i, padded_prompt_len:]
-                    cont_ids = cont.tolist()
-                    # Trim at first EOS/pad.
-                    end = len(cont_ids)
-                    for j, tid in enumerate(cont_ids):
-                        if tid in eos_ids:
-                            end = j
-                            break
-                    cont_trimmed = cont_ids[:end]
-                    text = tok.decode(cont_trimmed, skip_special_tokens=True)
-                    if THINK_OPEN in text:
-                        text = ChatTokenizer.strip_think(text)
-                    finish_reason: FinishReason = (
-                        "length" if end >= int(req.max_tokens) else "stop"
-                    )
-                    results.append(
-                        GenerationResult(
-                            text=text,
-                            prompt_tokens=int(prompt_lens[i]),
-                            completion_tokens=int(end),
-                            finish_reason=finish_reason,
-                        )
-                    )
-
-            # Throughput accounting — the primary signal we iterate against.
-            total_prompt = sum(r.prompt_tokens for r in results)
-            total_completion = sum(r.completion_tokens for r in results)
-            metrics.record_batch_throughput(
-                batch_size=n,
-                prompt_tokens=total_prompt,
-                completion_tokens=total_completion,
-                wall_s=wall_s,
-            )
-
-            for req, res in zip(batch, results):
-                if not req.future.done():
-                    req.future.set_result(res)
-
-        except Exception as e:
-            log.exception("batch processing failed: %s", e)
-            for req in batch:
-                if not req.future.done():
-                    req.future.set_exception(e)
-
-    def _generate_blocking(self, input_ids, attention_mask, gen_kwargs):
-        """Synchronous HF generate, called from a worker thread."""
-        import torch
-
-        loaded = self._loaded
-        self._batch_index += 1
-
-        # One-shot torch profile capture if armed and we're past warmup.
-        if (
-            self._profile_after_batches > 0
-            and not self._profile_done
-            and self._batch_index > self._profile_after_batches
-            and int(input_ids.shape[0]) >= self._profile_min_batch_size
-        ):
-            return self._generate_with_torch_profile(
-                input_ids, attention_mask, gen_kwargs, loaded
-            )
-
-        with time_region("engine.model.generate"):
-            with torch.inference_mode():
-                return loaded.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs,
-                )
-
-    # Number of tokens of generation to actually capture under torch.profiler.
-    # Full 1024-token batches produce ~hundred-MB chrome traces that take
-    # minutes to serialize and freeze the engine. 32 tokens covers prefill
-    # + a representative tail of decode steps — enough to see kernel
-    # launches, attention, MoE expert dispatch, and H2D syncs, without the
-    # export hit.
-    PROFILE_CAPTURE_NEW_TOKENS: int = 32
-
-    def _generate_with_torch_profile(
-        self, input_ids, attention_mask, gen_kwargs, loaded
-    ):
-        """One-shot torch.profiler capture of a *bounded* generation slice.
-
-        Profiles a short prefill + decode window so the chrome trace is
-        small enough to export in under a second. After capturing, runs
-        the *full* model.generate call so the calling request still gets
-        its real `max_new_tokens` worth of output. Flips `_profile_done`
-        so subsequent batches skip this path entirely.
-        """
-        import torch
-        from torch.profiler import ProfilerActivity, profile as torch_profile_ctx
-
-        full_max_new = int(gen_kwargs.get("max_new_tokens", 0))
-        capture_max_new = min(full_max_new, self.PROFILE_CAPTURE_NEW_TOKENS) or 8
-
-        log.info(
-            "torch.profiler: capturing batch %d (max_new_tokens=%d for capture, "
-            "request asked %d)",
-            self._batch_index, capture_max_new, full_max_new,
-        )
-
-        torch.cuda.synchronize()
-
-        capture_kwargs = dict(gen_kwargs)
-        capture_kwargs["max_new_tokens"] = capture_max_new
-
-        with torch_profile_ctx(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-            with_stack=False,        # huge cost, not needed for hotspot view
-            with_modules=False,
-            profile_memory=False,
-        ) as prof:
-            with time_region("engine.model.generate.profiled"):
-                with torch.inference_mode():
-                    _ = loaded.model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        **capture_kwargs,
-                    )
-            torch.cuda.synchronize()
-
-        # Export trace + summary + structured top kernels.
-        meta = {
-            "phase": "phase1_microbatch",
-            "batch_index": self._batch_index,
-            "batch_size": int(input_ids.shape[0]),
-            "input_padded_len": int(input_ids.shape[1]),
-            "captured_max_new_tokens": capture_max_new,
-            "request_max_new_tokens": full_max_new,
-            "do_sample": bool(gen_kwargs.get("do_sample", False)),
-            "model_name": self.model_name,
-            "device": self.device,
-            "attn_impl": self.attn_impl,
-        }
-        try:
-            chrome, summary, top_kernels = export_torch_profile(
-                prof, tag=self._profile_tag, extra_meta=meta
-            )
-            log.info(
-                "torch.profiler: chrome=%s summary=%s top1=%s",
-                chrome, summary, top_kernels[0] if top_kernels else None,
-            )
-        except Exception as e:
-            log.exception("torch.profiler export failed: %s", e)
+            log.exception("engine drain loop crashed: %s", e)
         finally:
-            self._profile_done = True
+            log.info("engine drain loop exited")
 
-        # Now actually serve the request (without profiling) so the caller
-        # gets the full max_new_tokens of output. The profile capture above
-        # warmed the cache for this exact batch, so this is fast.
-        with time_region("engine.model.generate.after_profile"):
-            with torch.inference_mode():
-                return loaded.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs,
+    def _resolve(self, seq: Sequence) -> None:
+        """Materialize the GenerationResult and resolve the user's future."""
+        assert self._loaded is not None
+        if seq.status is SequenceStatus.FAILED:
+            return  # exception already set
+
+        try:
+            with time_region("engine.decode_output_text"):
+                text = self._loaded.tokenizer.decode(
+                    seq.output_token_ids, skip_special_tokens=True
                 )
+            if THINK_OPEN in text:
+                text = ChatTokenizer.strip_think(text)
+
+            finish_reason = seq.status.finish_reason  # "stop" or "length"
+            result = GenerationResult(
+                text=text,
+                output_token_ids=list(seq.output_token_ids),
+                prompt_tokens=seq.prompt_len,
+                completion_tokens=seq.output_len,
+                finish_reason=finish_reason,
+            )
+        except Exception as e:
+            log.exception("resolve failed for %s: %s", seq.request_id, e)
+            result = e
+
+        loop: asyncio.AbstractEventLoop | None = getattr(seq, "_loop", None)
+        if loop is None:
+            return
+        if isinstance(result, Exception):
+            loop.call_soon_threadsafe(seq.future.set_exception, result)
+        else:
+            loop.call_soon_threadsafe(seq.future.set_result, result)
 
     # ------------------------------------------------------------------ #
-    # stub
+    # stub mode (laptop, no GPU)
     # ------------------------------------------------------------------ #
 
     def _stub_generate(
         self, messages: list[dict[str, str]], max_tokens: int
     ) -> GenerationResult:
-        """Return canned text without touching a model."""
         with time_region("engine.stub.render_prompt"):
             if self.tokenizer is not None:
                 prompt_tokens = self.tokenizer.count_prompt_tokens(messages)
@@ -513,6 +364,7 @@ class Engine:
         completion_tokens = min(max(1, len(text.split())), max_tokens)
         return GenerationResult(
             text=text,
+            output_token_ids=[],
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             finish_reason="stop",
@@ -524,7 +376,7 @@ class Engine:
 
     @staticmethod
     def make_request_id() -> str:
-        return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        return make_request_id()
 
     @staticmethod
     def now_unix() -> int:

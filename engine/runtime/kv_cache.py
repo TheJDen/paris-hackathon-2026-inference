@@ -1,0 +1,487 @@
+"""Slot-pool KV cache + DeltaNet state cache, sliced into HF's Cache contract.
+
+We bypass `model.generate()` entirely, but we still call HF's modeling layers
+(`Qwen3_5MoeAttention`, `Qwen3_5MoeGatedDeltaNet`, ...) directly and they
+expect a `transformers.cache_utils.Cache`-shaped object as `past_key_values`.
+This file gives them one.
+
+The big idea is **slot pooling** — pre-allocate one big tensor per layer
+that holds state for *all* concurrent slots, and gather/scatter the active
+batch's rows around each forward pass.
+
+  * Full-attention layers see a `[num_slots, max_seq_len, num_kv_heads, head_dim]`
+    tensor per layer. Each in-flight sequence owns one row (`slot_idx`); per-token
+    K/V append happens at `(slot_idx, position)`. The `update()` method writes
+    the new K/V into the right slot positions and returns a padded
+    `[B, H, max_kv_seq, D]` view for the attention call.
+  * Linear-attention (Gated DeltaNet) layers read `cache.layers[i].conv_states`
+    and `recurrent_states` as direct attributes and mutate them in place via
+    fla / causal_conv1d kernels. We give them an **active view** that's
+    gathered from the slot pool before forward and scattered back after.
+  * The runner hands a `BatchSlots` view to the cache before each forward
+    pass via `set_batch()`, and reclaims any in-place mutations via
+    `commit_batch()` afterward.
+
+Per-layer state lives in `self.layers[layer_idx]` like HF's DynamicCache,
+so any model code that reaches in via `cache.layers[layer_idx].conv_states`
+also works.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+
+log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# BatchSlots — what the runner sets before each forward pass
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class BatchSlots:
+    """Per-forward routing info the cache reads via `cache.batch`.
+
+    `slot_ids[i]` is the slot index of batch row i (so the cache knows
+    where to write/read inside its big slot-pool tensors).
+
+    `write_positions[i]` is a tensor of int64 — the absolute positions
+    inside slot `slot_ids[i]` the new K/V tokens land at.
+
+    For prefill of one slot with L prompt tokens:
+        slot_ids = [s]
+        write_positions = [[0, 1, 2, ..., L-1]]
+
+    For decode of N slots, each emitting one token at its current length:
+        slot_ids = [s0, s1, ..., sN-1]
+        write_positions = [[len0], [len1], ..., [lenN-1]]
+
+    `kv_seq_lens[i]` = TOTAL cached length for slot i AFTER this step's
+    write. The attention layer needs this to slice K_full / V_full.
+    """
+
+    slot_ids: torch.Tensor          # [B], int64
+    write_positions: list[torch.Tensor]  # B tensors of int64 (variable length per row)
+    query_lens: torch.Tensor        # [B], int64
+    kv_seq_lens: torch.Tensor       # [B], int64
+    is_prefill: bool
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.slot_ids.shape[0])
+
+
+# --------------------------------------------------------------------------- #
+# Per-layer slot-pool sub-objects
+# --------------------------------------------------------------------------- #
+
+
+class _SlotLayerBase:
+    """Common per-layer surface our HF-facing cache exposes via .layers[i].
+
+    HF's modeling code occasionally pokes at `cache.layers[layer_idx]`
+    methods directly, so the per-layer objects need to look enough like
+    HF's `CacheLayerMixin` to satisfy duck typing.
+    """
+
+    parent: "SlotPoolCache | None" = None
+
+    def get_seq_length(self) -> int:
+        if self.parent is None or self.parent.batch is None:
+            return 0
+        return int(self.parent.batch.kv_seq_lens.max().item())
+
+    def get_max_cache_shape(self) -> int:
+        if self.parent is None:
+            return 0
+        return self.parent.max_seq_len
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        if self.parent is None or self.parent.batch is None:
+            return query_length, 0
+        return int(self.parent.batch.kv_seq_lens.max().item()), 0
+
+
+class _FullAttentionSlotLayer(_SlotLayerBase):
+    """Slot-pool K/V tensors for one full-attention layer.
+
+    Shape `[num_slots, max_seq_len, num_kv_heads, head_dim]`. We allocate
+    once at startup, then write per-slot per-position.
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.k = torch.zeros(
+            num_slots, max_seq_len, num_kv_heads, head_dim,
+            dtype=dtype, device=device,
+        )
+        self.v = torch.zeros_like(self.k)
+
+
+class _LinearAttentionSlotLayer(_SlotLayerBase):
+    """Per-slot recurrent state + conv state for one Gated DeltaNet layer.
+
+    Pool tensors are **pre-allocated** at construction using shapes derived
+    from text_config (we used to lazy-init from the model's first emission,
+    but that ran *inside* `torch.inference_mode()` and produced inference
+    tensors that the scheduler couldn't reset later).
+
+    Conv state shape per HF modeling code:
+        in_proj_qkv = nn.Linear(hidden_size, key_dim*2 + value_dim, bias=False)
+        mixed_qkv:    [B, L, key_dim*2 + value_dim]  → transpose → [B, conv_dim, L]
+        conv_state:   [B, conv_dim, conv_kernel_size]   (F.pad to fill kernel width)
+    where `conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim`.
+
+    Recurrent state shape from fla `chunk_gated_delta_rule`:
+        [B, num_v_heads, head_k_dim, head_v_dim]
+    after the model's repeat_interleave to lift K up to num_v_heads.
+
+    The `conv_states` and `recurrent_states` attributes are the **active
+    batch view** — gathered from the pool before each forward, scattered
+    back after. The model reads them as `cache.layers[i].conv_states`,
+    mutates them in place via `causal_conv1d_update`, and the mutations
+    flow back to the pool on `cache.commit_batch()`.
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        conv_dim: int,
+        conv_kernel: int,
+        rec_num_heads: int,
+        rec_head_k_dim: int,
+        rec_head_v_dim: int,
+        device: torch.device,
+        kv_dtype: torch.dtype,
+        state_dtype: torch.dtype,
+    ) -> None:
+        self.num_slots = num_slots
+        self.device = device
+        # Conv state lives in the model's working dtype (BF16). The
+        # recurrent SSM state is fp32 (text_config.mamba_ssm_dtype).
+        self._pool_conv_states = torch.zeros(
+            num_slots, conv_dim, conv_kernel,
+            dtype=kv_dtype, device=device,
+        )
+        self._pool_recurrent_states = torch.zeros(
+            num_slots, rec_num_heads, rec_head_k_dim, rec_head_v_dim,
+            dtype=state_dtype, device=device,
+        )
+        # Active batch view — set by parent.set_batch(), scattered by commit.
+        self.conv_states: torch.Tensor | None = None
+        self.recurrent_states: torch.Tensor | None = None
+
+    # ------------------------- gather / scatter -------------------------
+
+    def gather_for_batch(self, slot_ids: torch.Tensor) -> None:
+        """Materialize the active view from the pool. Called before forward."""
+        # Clone so the model's in-place mutations don't fight other slots.
+        self.conv_states = self._pool_conv_states.index_select(0, slot_ids).clone()
+        self.recurrent_states = self._pool_recurrent_states.index_select(0, slot_ids).clone()
+
+    def scatter_after_batch(self, slot_ids: torch.Tensor) -> None:
+        """Persist the (possibly mutated) active view back into the pool."""
+        if self.conv_states is not None:
+            # Reshape if the model emitted a different trailing layout
+            # (e.g. fla can pack the recurrent state in [num_heads, k, v]
+            # vs [num_heads, v, k]). The pool was allocated with the
+            # config-derived layout and that's our source of truth.
+            if self.conv_states.shape[1:] != self._pool_conv_states.shape[1:]:
+                pass  # let the assignment raise so we notice
+            self._pool_conv_states.index_copy_(0, slot_ids, self.conv_states.to(self._pool_conv_states.dtype))
+        if self.recurrent_states is not None:
+            if self.recurrent_states.shape[1:] != self._pool_recurrent_states.shape[1:]:
+                pass
+            self._pool_recurrent_states.index_copy_(0, slot_ids, self.recurrent_states.to(self._pool_recurrent_states.dtype))
+
+    def reset_slot(self, slot_id: int) -> None:
+        self._pool_conv_states[slot_id].zero_()
+        self._pool_recurrent_states[slot_id].zero_()
+
+
+# --------------------------------------------------------------------------- #
+# The Cache itself
+# --------------------------------------------------------------------------- #
+
+
+class SlotPoolCache:
+    """Hybrid slot-pool cache for Qwen3.5-MoE.
+
+    NOT subclassing `transformers.cache_utils.Cache` because subclassing
+    HF's Cache pulls in its own constructor expectations. We expose the
+    same DUCK-typed surface (`update`, `get_seq_length`, `layers`,
+    `update_conv_state`, `update_recurrent_state`, `get_mask_sizes`,
+    `has_previous_state`) — that's all the modeling code touches.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        max_seq_len: int,
+        layer_types: list[str],
+        num_kv_heads: int,
+        head_dim: int,
+        # Linear-attention dims (from text_config)
+        linear_num_k_heads: int,
+        linear_num_v_heads: int,
+        linear_head_k_dim: int,
+        linear_head_v_dim: int,
+        linear_conv_kernel: int,
+        kv_dtype: torch.dtype,
+        state_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.num_slots = num_slots
+        self.max_seq_len = max_seq_len
+        self.layer_types = layer_types
+        self.device = device
+        self.kv_dtype = kv_dtype
+        self.state_dtype = state_dtype
+
+        # Per-slot active sequence length (number of tokens whose K/V is in
+        # the cache). Indexed by slot_idx.
+        self.slot_lengths = torch.zeros(num_slots, dtype=torch.int64, device=device)
+
+        # Per-layer slot-pool sub-objects.
+        layers: list[_FullAttentionSlotLayer | _LinearAttentionSlotLayer] = []
+        for i, t in enumerate(layer_types):
+            if t == "full_attention":
+                layers.append(
+                    _FullAttentionSlotLayer(
+                        num_slots=num_slots,
+                        max_seq_len=max_seq_len,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        dtype=kv_dtype,
+                        device=device,
+                    )
+                )
+            elif t == "linear_attention":
+                # Conv state width: 2 × key_dim + value_dim where
+                # key_dim = num_k_heads × head_k_dim, value_dim = num_v_heads × head_v_dim
+                key_dim = linear_num_k_heads * linear_head_k_dim
+                value_dim = linear_num_v_heads * linear_head_v_dim
+                conv_dim = 2 * key_dim + value_dim
+                layers.append(
+                    _LinearAttentionSlotLayer(
+                        num_slots=num_slots,
+                        conv_dim=conv_dim,
+                        conv_kernel=linear_conv_kernel,
+                        # Recurrent state shape after K repeat-interleave to v_heads:
+                        rec_num_heads=linear_num_v_heads,
+                        rec_head_k_dim=linear_head_k_dim,
+                        rec_head_v_dim=linear_head_v_dim,
+                        device=device,
+                        kv_dtype=kv_dtype,
+                        state_dtype=state_dtype,
+                    )
+                )
+            else:
+                raise ValueError(f"unknown layer_type at layer {i}: {t!r}")
+        self.layers = layers
+        for layer in self.layers:
+            layer.parent = self
+
+        # Set by the runner before each model forward pass.
+        self.batch: BatchSlots | None = None
+
+    # --------------------------------------------------------------- helpers
+
+    def reset_slot(self, slot_id: int) -> None:
+        """Free a slot — called when a sequence finishes."""
+        self.slot_lengths[slot_id] = 0
+        for layer in self.layers:
+            if isinstance(layer, _LinearAttentionSlotLayer):
+                layer.reset_slot(slot_id)
+        # Full-attention pool tensors don't need explicit zeroing — new
+        # prefill overwrites them and slot_lengths gates the read range.
+
+    def set_batch(self, batch: BatchSlots) -> None:
+        """Called by the runner before each model forward.
+
+        Materializes per-layer active views for the linear-attention
+        layers (gather from pool). Full-attention layers handle their
+        own write/read inside `update()`.
+        """
+        self.batch = batch
+        slot_ids = batch.slot_ids.long()
+        for layer in self.layers:
+            if isinstance(layer, _LinearAttentionSlotLayer):
+                layer.gather_for_batch(slot_ids)
+
+    def commit_batch(self) -> None:
+        """Called by the runner after each model forward.
+
+        Scatters any in-place mutations to per-layer active views (linear
+        attention layers) back into the slot pool.
+        """
+        if self.batch is None:
+            return
+        slot_ids = self.batch.slot_ids.long()
+        for layer in self.layers:
+            if isinstance(layer, _LinearAttentionSlotLayer):
+                layer.scatter_after_batch(slot_ids)
+        # Note: we leave self.batch set so any post-forward code that
+        # peeks at it (e.g. metrics) still sees the right thing. The next
+        # set_batch() call resets it.
+
+    # --------------------------------------------------------------- DynamicCache-shaped API
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Max active slot length, used by the model to derive position_ids."""
+        if self.batch is None:
+            return int(self.slot_lengths.max().item()) if self.num_slots else 0
+        return int(self.batch.kv_seq_lens.max().item())
+
+    def get_max_cache_shape(self) -> int | None:
+        return self.max_seq_len
+
+    def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
+
+    @property
+    def seen_tokens(self) -> int:
+        return self.get_seq_length()
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+        """HF mask construction calls this. Return (kv_length, kv_offset).
+
+        For our slot-pool, every full-attention layer's update() returns a
+        [B, H, max_kv_seq, D] view, so the mask is built against max_kv_seq
+        with offset 0. We do NOT add `query_length` because our `kv_seq_lens`
+        already accounts for the new tokens.
+        """
+        if self.batch is None:
+            return query_length, 0
+        return int(self.batch.kv_seq_lens.max().item()), 0
+
+    def has_previous_state(self, layer_idx: int | None = None) -> bool:
+        """Linear-attention layers ask this to decide between
+        'first time, fresh state' (prefill) vs 'continuing recurrence'
+        (decode). True iff we're in a decode step — every running slot
+        already has a recurrent state from its prefill.
+        """
+        if self.batch is None:
+            return False
+        return not self.batch.is_prefill
+
+    def is_compileable(self) -> bool:
+        return False
+
+    # --------------------------------------------------------------- full-attention update
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append (K, V) for one full-attention layer's batched forward.
+
+        Inputs from HF modeling code:
+          key_states / value_states: [B, num_kv_heads, L, head_dim]
+          B = batch size of this forward pass (== self.batch.batch_size)
+          L = number of new tokens this row contributes (1 for decode,
+              prompt_len for prefill of one slot at a time)
+
+        We write into the slot-pool tensor at the per-row write_positions,
+        then return (K_full, V_full) of shape
+          [B, num_kv_heads, max(seq_lens), head_dim]
+        with the unused tail zero (the attention mask masks it out).
+        """
+        layer = self.layers[layer_idx]
+        assert isinstance(layer, _FullAttentionSlotLayer)
+        assert self.batch is not None, "cache.set_batch must be called before forward"
+        batch = self.batch
+        B, H, L, D = key_states.shape
+        assert B == batch.batch_size, f"batch mismatch: K has {B}, batch says {batch.batch_size}"
+
+        # Per-row write — vectorize later. The HF (B, H, L, D) layout has
+        # heads in dim 1; we permute to (L, H, D) per row before storing.
+        for b in range(B):
+            slot_id = int(batch.slot_ids[b])
+            positions = batch.write_positions[b]
+            layer.k[slot_id, positions, :, :] = key_states[b].permute(1, 0, 2).to(layer.k.dtype)
+            layer.v[slot_id, positions, :, :] = value_states[b].permute(1, 0, 2).to(layer.v.dtype)
+            self.slot_lengths[slot_id] = batch.kv_seq_lens[b]
+
+        # Read step: build a padded [B, H, S, D] view where S = max kv_seq_len.
+        max_s = int(batch.kv_seq_lens.max().item())
+        out_k = torch.zeros(B, H, max_s, D, dtype=layer.k.dtype, device=layer.k.device)
+        out_v = torch.zeros_like(out_k)
+        for b in range(B):
+            slot_id = int(batch.slot_ids[b])
+            seq_len = int(batch.kv_seq_lens[b])
+            out_k[b, :, :seq_len, :] = layer.k[slot_id, :seq_len].permute(1, 0, 2)
+            out_v[b, :, :seq_len, :] = layer.v[slot_id, :seq_len].permute(1, 0, 2)
+        return out_k, out_v
+
+    # --------------------------------------------------------------- linear-attention updates
+
+    def update_conv_state(
+        self,
+        new_conv_state: torch.Tensor,
+        layer_idx: int,
+        cache_init: bool = False,
+        **_kwargs,
+    ) -> torch.Tensor:
+        """Set the active view for this layer's conv state.
+
+        The shape is `[B, 2*key_dim + value_dim, conv_kernel_size]`. The
+        scatter to the pool happens in `commit_batch()`.
+        """
+        layer = self.layers[layer_idx]
+        assert isinstance(layer, _LinearAttentionSlotLayer)
+        assert self.batch is not None
+        layer.conv_states = new_conv_state
+        return new_conv_state
+
+    def update_recurrent_state(
+        self,
+        new_recurrent_state: torch.Tensor,
+        layer_idx: int,
+        **_kwargs,
+    ) -> torch.Tensor:
+        """Set the active view for this layer's recurrent state.
+        Scatter to the pool happens in commit_batch."""
+        layer = self.layers[layer_idx]
+        assert isinstance(layer, _LinearAttentionSlotLayer)
+        assert self.batch is not None
+        layer.recurrent_states = new_recurrent_state
+        return new_recurrent_state
+
+    # --------------------------------------------------------------- diagnostics
+
+    def memory_bytes(self) -> int:
+        total = 0
+        for layer in self.layers:
+            if isinstance(layer, _FullAttentionSlotLayer):
+                total += layer.k.element_size() * layer.k.numel() * 2  # K + V
+            elif isinstance(layer, _LinearAttentionSlotLayer):
+                total += layer._pool_conv_states.element_size() * layer._pool_conv_states.numel()
+                total += layer._pool_recurrent_states.element_size() * layer._pool_recurrent_states.numel()
+        return total
+
+    def __repr__(self) -> str:
+        n_full = sum(1 for l in self.layers if isinstance(l, _FullAttentionSlotLayer))
+        n_lin = sum(1 for l in self.layers if isinstance(l, _LinearAttentionSlotLayer))
+        return (
+            f"SlotPoolCache(slots={self.num_slots}, max_seq_len={self.max_seq_len}, "
+            f"full_attn_layers={n_full}, linear_layers={n_lin}, "
+            f"mem_static={self.memory_bytes() / 1024**3:.2f} GB)"
+        )

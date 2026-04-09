@@ -197,6 +197,125 @@ def torch_profiler_tag() -> str:
     return _torch_profile_tag
 
 
+def annotate_hf_model_for_profiling(model, *, max_layers: int | None = None) -> int:
+    """Hook every decoder layer + its attention / mlp submodule with
+    `record_function` ranges so the chrome trace has named slices teammates
+    can navigate by phase instead of staring at thousands of `aten::*` ops.
+
+    The HF Qwen3_5MoeDecoderLayer pattern is `[L,L,L,F]` * 10 — full
+    attention every fourth layer, linear attention (Gated DeltaNet) the
+    rest. We name slices `model.layer_<i>.<full_attention|linear_attention>`
+    + `model.layer_<i>.self_attn` (full layers) or `model.layer_<i>.linear_attn`
+    (linear layers) + `model.layer_<i>.mlp` so Perfetto's "expand" view
+    walks the model layer-by-layer.
+
+    Returns the number of hooks installed. Safe to call multiple times —
+    duplicate hooks are not a correctness issue but you'll see noisy trace
+    output, so we install only once via a marker attribute.
+    """
+    if not _torch_profile_enabled:
+        # Hooks have a small CPU cost even when the profiler isn't active,
+        # because they push/pop record_function each forward. Skip if not
+        # armed; the engine should re-call this if profiling is later armed.
+        return 0
+
+    try:
+        import torch  # noqa: F401
+        from torch.profiler import record_function
+    except Exception:
+        return 0
+
+    # The inner Qwen3_5MoeTextModel lives at `model.model` for the CausalLM
+    # wrapper. Some loaders return the inner model directly.
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        return 0
+
+    if getattr(inner, "_engine_profile_hooks_installed", False):
+        return 0
+
+    layer_types = []
+    cfg = getattr(inner, "config", None)
+    if cfg is not None:
+        layer_types = list(getattr(cfg, "layer_types", []) or [])
+
+    def _make_hooks(name: str):
+        rf_box: dict[str, object] = {}
+
+        def pre(_module, _inputs):
+            ctx = record_function(name)
+            ctx.__enter__()
+            rf_box["ctx"] = ctx
+
+        def post(_module, _inputs, _output):
+            ctx = rf_box.pop("ctx", None)
+            if ctx is not None:
+                try:
+                    ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+        return pre, post
+
+    installed = 0
+    n_layers = len(layers) if max_layers is None else min(max_layers, len(layers))
+    for i in range(n_layers):
+        layer = layers[i]
+        layer_kind = layer_types[i] if i < len(layer_types) else "layer"
+
+        # Outer decoder-layer slice
+        pre, post = _make_hooks(f"model.layer_{i:02d}.{layer_kind}")
+        layer.register_forward_pre_hook(pre)
+        layer.register_forward_hook(post)
+        installed += 2
+
+        # Attention submodule (either full self_attn or linear gated delta net)
+        for attn_attr in ("self_attn", "linear_attn", "delta_net", "gated_delta_net"):
+            sub = getattr(layer, attn_attr, None)
+            if sub is not None:
+                pre2, post2 = _make_hooks(f"model.layer_{i:02d}.{attn_attr}")
+                sub.register_forward_pre_hook(pre2)
+                sub.register_forward_hook(post2)
+                installed += 2
+                break
+
+        # MoE / mlp block
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            pre3, post3 = _make_hooks(f"model.layer_{i:02d}.mlp")
+            mlp.register_forward_pre_hook(pre3)
+            mlp.register_forward_hook(post3)
+            installed += 2
+
+            # If the MoE block exposes an experts container, annotate that too
+            for moe_attr in ("experts", "shared_expert", "gate"):
+                sub = getattr(mlp, moe_attr, None)
+                if sub is not None:
+                    pre4, post4 = _make_hooks(f"model.layer_{i:02d}.mlp.{moe_attr}")
+                    sub.register_forward_pre_hook(pre4)
+                    sub.register_forward_hook(post4)
+                    installed += 2
+
+    # Annotate embed + lm_head + norm too
+    for top_name in ("embed_tokens", "norm"):
+        sub = getattr(inner, top_name, None)
+        if sub is not None:
+            pre5, post5 = _make_hooks(f"model.{top_name}")
+            sub.register_forward_pre_hook(pre5)
+            sub.register_forward_hook(post5)
+            installed += 2
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None:
+        pre6, post6 = _make_hooks("model.lm_head")
+        lm_head.register_forward_pre_hook(pre6)
+        lm_head.register_forward_hook(post6)
+        installed += 2
+
+    inner._engine_profile_hooks_installed = True
+    return installed
+
+
 def _git_short_sha() -> str:
     """Best-effort git SHA without depending on subprocess.run on hot paths."""
     try:
