@@ -1,0 +1,33 @@
+{
+  "model": "/mnt/data/jaden/models/Qwen3.5-35B-A3B",
+  "config": {
+    "input_tokens": 1024,
+    "output_tokens": 1024,
+    "num_requests_per_level": 64,
+    "num_prompts": 128,
+    "concurrency": [
+      64
+    ]
+  },
+  "results": [
+    {
+      "concurrency": 64,
+      "throughput_tok_per_sec": 979.16,
+      "total_tokens": 86986,
+      "total_prompt_tokens": 66327,
+      "total_completion_tokens": 20659,
+      "reported_prompt_tokens": 66327,
+      "reported_completion_tokens": 20726,
+      "successful_requests": 64,
+      "failed_requests": 0,
+      "wall_time_sec": 88.84,
+      "token_discrepancy": false,
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0
+    }
+  ],
+  "partial_weighted_score": 7833.28,
+  "weight_covered": 8,
+  "elapsed_s": 125.17182675600634,
+  "captured_at": "2026-04-09T17:03:57.183813Z"
+}

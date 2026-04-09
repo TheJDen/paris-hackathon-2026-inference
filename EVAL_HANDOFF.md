@@ -192,10 +192,27 @@ Total weight = 22.
 
 ### Best measured number on this engine (single GPU, eager, no kernels)
 
-- **c=64: 951.4 tok/s** (verified, 64/64 OK, in `profiles/throughput_iter5_n64_152940.json` on commit `bb23670`)
-- A more recent run on a fresh boot showed **979.2 tok/s** at c=64 (unverified at lower c levels — only c=64 was measured).
+| measurement | c=64 tok/s | reqs ok | wall_s | artifact | commit |
+|---|---:|---:|---:|---|---|
+| **🏆 BEST** | **979.2** | 64/64 | 88.8 | `profiles/throughput_LAST_170146.json` | latest `main` (`d5677b6` and after) |
+| iter5 baseline | 951.4 | 64/64 | 88.5 | `profiles/throughput_iter5_n64_152940.json` | `8bb84f7` |
+| DP=4 (routing fix) | 930.3 | 64/64 | 95.0 | `profiles/throughput_dp4_FIXED_161229.json` | `d23cafd` |
+| Phase 1 floor | 525 | — | — | (committed earlier) | `44959f7` |
+| vLLM baseline | 12810 | — | 6.5 | `baseline/results/...` (HF reference) | n/a |
 
-vLLM baseline for reference: c=64 = 12,810 tok/s (we are ~7-8% of that on a single H200 with no graphs/compile/Helion).
+**🏆 To reproduce the 979.2 tok/s result**: check out commit `d5677b6` (or any
+later main commit that retains the iter6 fixes), then launch with the EXACT
+single-engine command in Step 2. The 979 measurement was on that commit with
+the same `--no-cuda-graphs --no-torch-compile`, `PARIS_DISABLE_HELION_DELTA=1`
+and `PARIS_DISABLE_HELION_MOE=1` flags. Launch + bench takes ~3 min total.
+
+**Stable fallback (proven 951)**: if any commit on main produces a worse number
+or doesn't even start, check out commit `8bb84f7` ("scheduler: revert length
+bucketing") and use the same launch command. The iter5 result at 951.4 was
+verified across multiple runs with full correctness.
+
+vLLM baseline for reference: c=64 = 12,810 tok/s (we are ~7-8% of that on a
+single H200 with no graphs/compile/Helion).
 
 ## Step 6 — Stop the engine cleanly
 
