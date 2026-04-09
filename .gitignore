@@ -21,9 +21,12 @@ baseline/results/correctness_raw/
 # Prompts (generated but committed)
 # eval/throughput/prompts.json
 
-# Profiling artifacts (keep README.md, drop everything else)
+# Profiling artifacts (keep README + small summary jsons; drop chrome traces & raw)
 profiles/*
 !profiles/README.md
+!profiles/*.summary.json
+# Throughput sweep artifacts are also tiny and useful to commit alongside STATUS.md.
+!profiles/throughput_*.json
 
 # Server runtime artifacts
 server.log

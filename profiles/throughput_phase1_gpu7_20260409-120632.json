@@ -1,0 +1,65 @@
+{
+  "model": "/mnt/data/jaden/models/Qwen3.5-35B-A3B",
+  "config": {
+    "input_tokens": 1024,
+    "output_tokens": 1024,
+    "num_requests_per_level": 32,
+    "num_prompts": 128,
+    "concurrency": [
+      16,
+      32,
+      64
+    ]
+  },
+  "results": [
+    {
+      "concurrency": 16,
+      "throughput_tok_per_sec": 349.82,
+      "total_tokens": 43312,
+      "total_prompt_tokens": 33172,
+      "total_completion_tokens": 10140,
+      "reported_prompt_tokens": 33172,
+      "reported_completion_tokens": 10140,
+      "successful_requests": 32,
+      "failed_requests": 0,
+      "wall_time_sec": 123.81,
+      "token_discrepancy": false,
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0
+    },
+    {
+      "concurrency": 32,
+      "throughput_tok_per_sec": 694.39,
+      "total_tokens": 42730,
+      "total_prompt_tokens": 33172,
+      "total_completion_tokens": 9558,
+      "reported_prompt_tokens": 33172,
+      "reported_completion_tokens": 9560,
+      "successful_requests": 32,
+      "failed_requests": 0,
+      "wall_time_sec": 61.54,
+      "token_discrepancy": false,
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0
+    },
+    {
+      "concurrency": 64,
+      "throughput_tok_per_sec": 525.42,
+      "total_tokens": 41605,
+      "total_prompt_tokens": 33172,
+      "total_completion_tokens": 8433,
+      "reported_prompt_tokens": 33172,
+      "reported_completion_tokens": 8440,
+      "successful_requests": 32,
+      "failed_requests": 0,
+      "wall_time_sec": 79.18,
+      "token_discrepancy": false,
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0
+    }
+  ],
+  "partial_weighted_score": 8380.2,
+  "weight_covered": 16,
+  "elapsed_s": 344.82374519100995,
+  "captured_at": "2026-04-09T12:12:23.011124Z"
+}

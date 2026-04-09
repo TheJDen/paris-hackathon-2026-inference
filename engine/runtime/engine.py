@@ -35,7 +35,12 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from engine.runtime.metrics import metrics
-from engine.runtime.profiling import time_region
+from engine.runtime.profiling import (
+    export_torch_profile,
+    time_region,
+    torch_profiler_enabled,
+    torch_profiler_tag,
+)
 from engine.tokenizer.chat_template import ChatTokenizer, THINK_OPEN
 
 
@@ -84,6 +89,8 @@ class Engine:
         device: str = "cuda:0",
         attn_impl: str = "sdpa",
         batch_window_ms: float = 5.0,
+        profile_torch_after_batches: int = 0,
+        profile_torch_tag: str = "run",
     ) -> None:
         self.model_name = model_name
         self.stub = stub
@@ -93,6 +100,14 @@ class Engine:
         self.device = device
         self.attn_impl = attn_impl
         self.batch_window_s = batch_window_ms / 1000.0
+
+        # One-shot torch.profiler capture: skip the first N batches as
+        # warmup, then capture batch N+1 inside torch.profiler.profile,
+        # export, and disable. Set to 0 to disable; >0 enables.
+        self._profile_after_batches = int(profile_torch_after_batches)
+        self._profile_tag = str(profile_torch_tag)
+        self._profile_done = False
+        self._batch_index = 0
 
         self.tokenizer: ChatTokenizer | None = None
         self._loaded = None  # LoadedModel from engine.model.qwen3_next
@@ -349,6 +364,18 @@ class Engine:
         import torch
 
         loaded = self._loaded
+        self._batch_index += 1
+
+        # One-shot torch profile capture if armed and we're past warmup.
+        if (
+            self._profile_after_batches > 0
+            and not self._profile_done
+            and self._batch_index > self._profile_after_batches
+        ):
+            return self._generate_with_torch_profile(
+                input_ids, attention_mask, gen_kwargs, loaded
+            )
+
         with time_region("engine.model.generate"):
             with torch.inference_mode():
                 return loaded.model.generate(
@@ -356,6 +383,66 @@ class Engine:
                     attention_mask=attention_mask,
                     **gen_kwargs,
                 )
+
+    def _generate_with_torch_profile(
+        self, input_ids, attention_mask, gen_kwargs, loaded
+    ):
+        """One-shot torch.profiler capture of a single steady-state batch.
+
+        Wraps the entire `model.generate` call (which itself runs many
+        forward steps) so the trace covers the full prefill + decode of
+        one batch. After capturing, exports artifacts and flips
+        `_profile_done` so subsequent batches go through the fast path.
+        """
+        import torch
+        from torch.profiler import ProfilerActivity, profile as torch_profile_ctx
+
+        log.info("torch.profiler: capturing batch %d", self._batch_index)
+
+        torch.cuda.synchronize()
+
+        with torch_profile_ctx(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=True,
+            with_modules=True,
+            profile_memory=False,
+        ) as prof:
+            with time_region("engine.model.generate.profiled"):
+                with torch.inference_mode():
+                    output = loaded.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        **gen_kwargs,
+                    )
+            torch.cuda.synchronize()
+
+        # Export trace + summary + structured top kernels.
+        meta = {
+            "phase": "phase1_microbatch",
+            "batch_index": self._batch_index,
+            "batch_size": int(input_ids.shape[0]),
+            "input_padded_len": int(input_ids.shape[1]),
+            "max_new_tokens": int(gen_kwargs.get("max_new_tokens", 0)),
+            "do_sample": bool(gen_kwargs.get("do_sample", False)),
+            "model_name": self.model_name,
+            "device": self.device,
+            "attn_impl": self.attn_impl,
+        }
+        try:
+            chrome, summary, top_kernels = export_torch_profile(
+                prof, tag=self._profile_tag, extra_meta=meta
+            )
+            log.info(
+                "torch.profiler: chrome=%s summary=%s top1=%s",
+                chrome, summary, top_kernels[0] if top_kernels else None,
+            )
+        except Exception as e:
+            log.exception("torch.profiler export failed: %s", e)
+        finally:
+            self._profile_done = True
+
+        return output
 
     # ------------------------------------------------------------------ #
     # stub

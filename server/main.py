@@ -58,12 +58,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--profile-torch",
         action="store_true",
-        help="arm torch.profiler for a bounded window (deep-dive only)",
+        help="arm torch.profiler so record_function regions are emitted",
     )
     p.add_argument(
-        "--profile-window",
-        default=None,
-        help="step window for torch.profiler, e.g. 10:20",
+        "--profile-torch-after-batches",
+        type=int,
+        default=0,
+        help="capture a one-shot torch profile of batch N+1 after N warmup batches "
+        "(0 disables). Output lands in profiles/torch_<tag>_<ts>.{json.gz,txt}",
     )
     p.add_argument("--profile-tag", default="run", help="tag for profile artifact names")
     return p.parse_args()
@@ -73,12 +75,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     args = parse_args()
 
-    if args.profile_torch:
-        window = None
-        if args.profile_window:
-            start, stop = args.profile_window.split(":")
-            window = (int(start), int(stop))
-        enable_torch_profiler(window, tag=args.profile_tag)
+    if args.profile_torch or args.profile_torch_after_batches > 0:
+        enable_torch_profiler(tag=args.profile_tag)
 
     log.info(
         "building engine model=%s stub=%s tp=%d max_batch=%d max_model_len=%d",
@@ -93,6 +91,8 @@ def main() -> None:
         device=args.device,
         attn_impl=args.attn_impl,
         batch_window_ms=args.batch_window_ms,
+        profile_torch_after_batches=args.profile_torch_after_batches,
+        profile_torch_tag=args.profile_tag,
     )
 
     if args.metrics_interval > 0:

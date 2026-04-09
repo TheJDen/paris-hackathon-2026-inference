@@ -160,7 +160,7 @@ def reset_region_stats() -> None:
 
 
 _torch_profile_enabled = False
-_torch_profiler = None  # set when active
+_torch_profile_tag: str = "run"
 _PROFILE_DIR = os.environ.get("PROFILE_DIR", "profiles")
 
 
@@ -176,16 +176,83 @@ def _maybe_record_function(name: str):
         return contextlib.nullcontext()
 
 
-def enable_torch_profiler(window: tuple[int, int] | None, tag: str) -> None:
-    """Arm torch.profiler. The actual capture is driven by `step()` calls
-    from the engine loop and bounded to `window` (start_step, end_step) to
-    skip warmup. Output lands in `profiles/torch_<tag>_<ts>.{json.gz,txt}`.
+def enable_torch_profiler(tag: str = "run") -> None:
+    """Arm torch.profiler so `record_function` regions are emitted.
+
+    The actual capture is one-shot in the engine: see
+    `Engine._maybe_capture_torch_profile`. We just flip the flag here so
+    the time_region wrapper also pushes named ranges into the profile.
     """
-    global _torch_profile_enabled
+    global _torch_profile_enabled, _torch_profile_tag
     _torch_profile_enabled = True
+    _torch_profile_tag = tag
     os.makedirs(_PROFILE_DIR, exist_ok=True)
-    # Engine wires the actual schedule; we just record intent here. The
-    # heavy import is deferred so the laptop stub never imports torch.
-    os.environ["_TORCH_PROFILE_TAG"] = tag
-    if window is not None:
-        os.environ["_TORCH_PROFILE_WINDOW"] = f"{window[0]}:{window[1]}"
+
+
+def torch_profiler_enabled() -> bool:
+    return _torch_profile_enabled
+
+
+def torch_profiler_tag() -> str:
+    return _torch_profile_tag
+
+
+def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tuple[str, str, list[dict]]:
+    """Dump a finished torch.profiler.profile to disk.
+
+    Returns (chrome_trace_path, summary_path, top_kernels).
+
+    `top_kernels` is a list of `{name, self_cuda_us, self_cpu_us, count}`
+    dicts for the top 30 ops by self CUDA time, suitable for embedding
+    in STATUS.md.
+    """
+    import datetime as _dt
+    import json
+
+    os.makedirs(_PROFILE_DIR, exist_ok=True)
+    ts = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    chrome_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.json.gz")
+    summary_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.txt")
+    json_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.summary.json")
+
+    # Chrome trace
+    try:
+        prof.export_chrome_trace(chrome_path)
+    except Exception as e:
+        chrome_path = ""
+        print(f"[profile] chrome trace export failed: {e}")
+
+    # Sorted summary table — what humans read first
+    table = prof.key_averages().table(
+        sort_by="self_cuda_time_total",
+        row_limit=30,
+    )
+    with open(summary_path, "w") as f:
+        if extra_meta:
+            for k, v in extra_meta.items():
+                f.write(f"# {k}: {v}\n")
+            f.write("\n")
+        f.write(table)
+
+    # Structured top-N for STATUS.md
+    top_kernels: list[dict] = []
+    for ev in prof.key_averages():
+        try:
+            self_cuda = float(ev.self_cuda_time_total)
+            self_cpu = float(ev.self_cpu_time_total)
+        except Exception:
+            self_cuda = 0.0
+            self_cpu = 0.0
+        top_kernels.append({
+            "name": str(ev.key),
+            "self_cuda_us": self_cuda,
+            "self_cpu_us": self_cpu,
+            "count": int(getattr(ev, "count", 0)),
+        })
+    top_kernels.sort(key=lambda d: d["self_cuda_us"], reverse=True)
+    top_kernels = top_kernels[:30]
+
+    with open(json_path, "w") as f:
+        json.dump({"top_kernels": top_kernels, "meta": extra_meta or {}}, f, indent=2)
+
+    return chrome_path, summary_path, top_kernels

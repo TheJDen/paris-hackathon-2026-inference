@@ -1,239 +1,96 @@
 # HACKING
 
-How to get the engine running and what's been built so far. Read this first.
+Setup, commands, and conventions. **For latest stats and the current
+implementation, see [`STATUS.md`](STATUS.md)** — auto-regenerated on
+every push by `bench/refresh_status.py`. This document is the slow-changing
+how-to.
 
-The official rules + scoring live in [`README.md`](README.md). This document is
-about *our* implementation — directory layout, dependency gotchas, how to launch
-the server, how to iterate, and what's done vs what's next.
+## Setup on the H200 box (one-time)
 
-## TL;DR — what works today
-
-- **Server**: FastAPI app at `server/app.py`, OpenAI-compatible
-  `POST /v1/chat/completions` + `GET /health`. Passes `eval/check_server.py`
-  against both the laptop stub and the real GPU engine.
-- **Engine**: `engine/runtime/engine.py` — loads `Qwen3_5MoeForCausalLM`
-  (text-only branch of the multimodal `Qwen3_5MoeForConditionalGeneration`
-  checkpoint) via HuggingFace `transformers` 5.5.1, runs **static
-  microbatching** on a single H200. No paged KV, no continuous batching, no TP
-  yet (Phase 2).
-- **Tokenizer / chat template**: `engine/tokenizer/chat_template.py` wraps
-  `apply_chat_template(..., enable_thinking=False)`. Important: Qwen3.5
-  implements thinking-disabled by inserting an *empty* `<think>\n\n</think>\n\n`
-  block in the rendered prompt — that is the correct behavior, do not assert
-  it away. The output side is guarded with `strip_think`.
-- **Profiling, primary**: `engine/runtime/profiling.py` defines a
-  `RegionTimer` exposed via `time_region("name")` / `@timed("name")`. Per-region
-  call counts, mean, p50, p99 are dumped via `GET /metrics/regions` (or on
-  shutdown to stdout). This is the **default** profiling surface — every
-  optimization decision starts here.
-- **Profiling, secondary**: `torch.profiler` is wired but only enabled with
-  `--profile-torch --profile-window=10:20`. Use it to drill *inside* a region
-  the CLI table has already flagged. Don't reach for it by default.
-- **Live metrics**: `engine/runtime/metrics.py` always-on counters at
-  `GET /metrics`: tok/s in/out, request p50/p99, batch hist, KV occupancy
-  (populated in Phase 2+).
-
-Phase 0 conformance + Phase 1 correctness are both green:
-
-- `eval/check_server.py` → both checks PASS against the real engine.
-- **Full GSM8K gate (200 problems, num_concurrent=32, microbatch=32):
-  92.0% flexible-extract / 91.0% strict-match.** Gate is 87.5%; vLLM's
-  reported baseline is 91.5% / 91.0%, so we're tied. Wall time 3:01.
-- Mini GSM8K (limit=20, num_concurrent=32) → 85% on a randomly seeded
-  20-problem subset (small-sample noise — full 200 is the source of truth).
-
-## Status: where we are in the plan
-
-| Phase | Goal | Status |
-|---|---|---|
-| 0 | Server skeleton + chat template + stub engine, laptop-side | ✅ done |
-| 1 | HF reference on a single H200, pass GSM8K ≥ 87.5% | ✅ done — 92.0% flex / 91.0% strict, full 200-problem run, wall 3:01 |
-| 2 | Continuous batching, paged KV, DeltaNet state cache, **TP=8**, real perf | next |
-| 3 | Custom Helion kernels for MoE grouped GEMM + DeltaNet recurrence | after |
-| 4 | TP vs hybrid TP+EP for MoE, decided on profile data | after |
-| 5 | Helion autotuning, scheduler tuning, CUDA graphs, prefix cache | last |
-
-The throughput target is vLLM's **12,810 tok/s @ c=64** (see README baseline).
-Phase 1 is correctness only — do not optimize Phase 1, it's a stepping stone.
-
-## Repository layout (added by us — `eval/` and `baseline/` are upstream)
-
-```
-engine/
-  config.py                       # (placeholder)
-  model/
-    qwen3_next.py                 # HF Qwen3_5MoeForCausalLM loader + arch facts
-  runtime/
-    engine.py                     # Engine: stub + Phase 1 microbatcher
-    metrics.py                    # always-on counters
-    profiling.py                  # RegionTimer (CLI-first), torch.profiler hookable
-  tokenizer/
-    chat_template.py              # apply_chat_template wrapper, enable_thinking=False
-server/
-  app.py                          # FastAPI app, /health + /v1/chat/completions + /metrics{,/regions}
-  main.py                         # entrypoint: parses CLI, runs uvicorn
-  protocol.py                     # pydantic models pinned to eval/check_server expectations
-scripts/
-  start.sh                        # SUBMISSION ENTRYPOINT — backgrounds server, waits /health, exit 0
-  download_weights.sh             # snapshot_download with hf_transfer
-  smoke_gen.py                    # single-prompt smoke test bypassing the server
-profiles/
-  README.md                       # naming convention for profile artifacts
-HACKING.md                        # this file
-```
-
-## Architecture facts (Qwen3.5-35B-A3B text branch)
-
-Captured from `cfg.text_config`:
-
-| | |
-|---|---|
-| Total / active params | 35B / 3B |
-| Layers | 40 |
-| Layer pattern | groups of `[linear, linear, linear, full]` → 30 linear-attention (Gated DeltaNet) + 10 full-attention layers |
-| `full_attention_interval` | 4 |
-| hidden_size | 2048 |
-| Attention heads | 16 (GQA, 2 KV heads, head_dim=256) |
-| `attn_output_gate` | True |
-| Linear-attn (DeltaNet) | 32 value heads, 16 key heads, head_dim=128, conv_kernel=4, mamba SSM in fp32 |
-| MoE | 256 experts, 8 active, moe_intermediate_size=512, +1 shared expert (intermediate=512) |
-| Vocab | 248320 |
-| Max context | 262144 |
-| RoPE | mrope_interleaved (multimodal RoPE), theta=1e7, partial_rotary_factor=0.25 |
-| Multi-token prediction | `mtp_num_hidden_layers=1` (interesting for spec-decode in Phase 5) |
-
-The **multimodal checkpoint** ships as `Qwen3_5MoeForConditionalGeneration`
-(text + vision + video). For our text-only inference, we instantiate
-`Qwen3_5MoeForCausalLM` directly against the same checkpoint — vision tower
-weights are silently ignored, saving GPU memory.
-
-## Setup from scratch on the H200 box
-
-The node has 8x H200 (140 GB each), driver 580.126, CUDA 13.0, Python 3.12.3
-in `/usr/bin`. **Do not use the system Python** — it ships without `Python.h`
-and Triton fails to compile its CUDA utility at import time, which silently
-breaks `flash-linear-attention`. Use a uv-managed Python instead.
+The system Python is missing `Python.h`, which silently breaks Triton
+and pushes `flash-linear-attention` into a CPU fallback that crashes
+inside the model forward. **Use a uv-managed Python.**
 
 ```bash
-# 1. uv (per-user, no sudo)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=$HOME/.local/bin:$PATH
-
-# 2. uv-managed CPython 3.12 (this one HAS Python.h)
 uv python install 3.12
 
-# 3. clone + venv + deps
 git clone git@github.com:TheJDen/paris-hackathon-2026-inference.git
 cd paris-hackathon-2026-inference
 uv venv --python 3.12
 uv pip install -e ".[engine]" hf_transfer accelerate flash-linear-attention
 
-# 4. weights (~67 GB, ~1 min on this network)
-./scripts/download_weights.sh
-# → /mnt/data/$USER/models/Qwen3.5-35B-A3B
+# Optional but worth it (~9 min one-shot build):
+CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=16 \
+  uv pip install --no-build-isolation causal-conv1d
+
+./scripts/download_weights.sh   # ~67 GB → ~/models/Qwen3.5-35B-A3B
 ```
 
-### Dependency landmines we already hit
+### Dependency landmines (battle scars)
 
-1. **`Python.h` missing** with system Python → Triton fallback to CPU →
-   `flash-linear-attention` thinks the device is CPU → crashes with
-   `module 'torch.cpu' has no attribute 'device'`. **Fix**: use
-   `uv python install 3.12` so headers come along.
-2. **`accelerate` is required** for HF `from_pretrained(device_map=...)`.
-   Plain `pip install accelerate` works.
-3. **`causal-conv1d`** wants to build a CUDA extension and the default
-   uv build env pulls in a torch wheel built against cu128 which then
-   refuses to compile against the cu130 toolchain. The fix is
-   `--no-build-isolation` so the build sees our installed cu130 torch:
-   ```bash
-   CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=16 \
-     uv pip install --no-build-isolation causal-conv1d
-   ```
-   The build takes ~9 minutes (it compiles for many sm targets even with
-   `TORCH_CUDA_ARCH_LIST` set — setup.py overrides). Already installed
-   on the box.
-4. **`fla` 0.4.2** needs the Python.h fix above. Once that's in, it
-   detects CUDA + Hopper correctly and the DeltaNet layers stop running
-   on the slow torch fallback.
+- **`Python.h` missing** with system Python → fla detects "cpu" → crash. Fix: uv-managed Python.
+- **`accelerate`** is required for HF `device_map=...`.
+- **`causal-conv1d`** wants to build a CUDA ext; uv's build env pulls in cu128 torch which mismatches the cu130 we have. Fix: `--no-build-isolation`.
+- **`fla` 0.4.2** has a `torch.cpu.device(...)` call that only fires when triton fell back to CPU. Resolved by the `Python.h` fix above.
 
-## Launching the server
-
-### Real engine (one H200)
+## Launch the server
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=7 \
   PYTHON=.venv/bin/python \
   PORT=8765 \
   MODEL=/mnt/data/$USER/models/Qwen3.5-35B-A3B \
   HEALTH_TIMEOUT=300 \
   ./scripts/start.sh \
     --device cuda:0 \
-    --max-batch 32 \
-    --batch-window-ms 20
+    --max-batch 64 \
+    --batch-window-ms 500 \
+    --profile-torch-after-batches 3   # optional, see below
 ```
 
-`scripts/start.sh` backgrounds the server, polls `/health` until ready, and
-exits 0 leaving the server running — that's the contract the submission
-rules require.
+`scripts/start.sh` backgrounds uvicorn, polls `/health`, exits 0 leaving
+the server running — the contract submission requires.
 
-### Stub (laptop, no GPU)
+GPU 7 is the least-contested on this shared box; pick a free index.
+`--profile-torch-after-batches 3` arms a one-shot torch profile capture
+of batch 4 (i.e. one steady-state batch after warmup).
+
+## The iteration loop
+
+**Default per-change loop (≈1-5 min):**
 
 ```bash
-./scripts/start.sh --stub
+.venv/bin/python -m bench.quick_throughput --base-url http://localhost:8765
 ```
 
-Returns canned `"ok"` text. Useful for verifying the OpenAI shape locally.
+Runs `c=16, 32, 64` (the levels worth 16/22 = **73% of the score**),
+32 reqs/level, runtime random prompts via the same code path the
+official scoring uses (`eval.throughput.run_throughput.run_concurrency_level`).
+Prints per-level tok/s, partial weighted score, the engine region table,
+and live `/metrics`. Spot checks are off by default — they fragment the
+batches into greedy/sampled sub-batches and add noise. Use
+`--with-spot-checks` to mirror the official harness exactly.
 
-## Iteration loop — throughput first, correctness as a pre-merge gate
-
-We are scored on **weighted output tok/s** at concurrency 1..64. The
-high-concurrency levels carry the most weight (`c=16`+`c=32`+`c=64` =
-**16/22 ≈ 73% of the score**, and `c=64` alone is 8/22). The correctness
-eval is a hard gate but it does not move the score — we should run it
-**sparingly** (before pushing to main, after large changes, on CI),
-**not** on every per-change iteration.
-
-### Default per-change loop: quick throughput
+**Pre-push refresh (the only command teammates need to memorize):**
 
 ```bash
-.venv/bin/python -m bench.quick_throughput \
-  --base-url http://localhost:8765 \
-  --output profiles/throughput_<scenario>_<sha>.json
+.venv/bin/python -m bench.refresh_status --base-url http://localhost:8765
+git add STATUS.md profiles/
+git commit -m "..."
+git push
 ```
 
-Defaults to **c=16, 32, 64** (the high-weight levels), 16 requests/level
-(vs the harness's 64), runtime random prompts via the same code path the
-official scoring uses (`eval.throughput.run_throughput.run_benchmark`).
-Finishes in ~1 minute on a working engine. Prints:
+`refresh_status` runs the quick throughput, fetches `/metrics` +
+`/metrics/regions`, picks up the freshest `profiles/torch_*.summary.json`
+left by the engine, extracts the top-12 kernels by self CUDA time, and
+**rewrites `STATUS.md`** so teammates always see the latest commit's
+implementation + numbers + profile in one place. The implementation
+summary itself lives in `bench/.status_intro.md` — update it manually
+when the engine architecture meaningfully changes.
 
-- per-level tok/s + wall + spot-check results
-- the **partial weighted score** for the levels we ran
-- a rough extrapolation to all 7 levels (NOT the official number — just a
-  hint of where we'd land)
-- the engine's CLI region table fetched from `/metrics/regions` (so each
-  iteration drops a snapshot you can diff against the previous one)
-- the live `/metrics` snapshot (rolling-window tok/s, batch fill, etc.)
-
-For the full sweep that mirrors the official eval (~5x slower):
-
-```bash
-.venv/bin/python -m bench.quick_throughput \
-  --base-url http://localhost:8765 \
-  --concurrency 1 2 4 8 16 32 64 \
-  --num-requests 64
-```
-
-Or directly:
-
-```bash
-.venv/bin/python -m eval.throughput.run_throughput \
-  --base-url http://localhost:8765
-```
-
-### Pre-merge gate: full GSM8K-CoT (≥ 87.5%, ~3 min on Phase 1)
-
-Run **before pushing to main** and after any change that touches the model
-forward path or sampler. Do **not** run per-iteration.
+**Pre-merge gate (≈3 min, only before merging to main):**
 
 ```bash
 .venv/bin/python -m eval.correctness.run_correctness \
@@ -243,221 +100,46 @@ forward path or sampler. Do **not** run per-iteration.
   --output-dir results/correctness_raw_<sha>
 ```
 
-A 20-problem mini check is too noisy at this sample size — just run the
-full 200. It's ~3 min.
+Full 200-problem GSM8K-CoT, gate ≥ 87.5%. **Do not run per-iteration** —
+it's not the loss function we're optimizing, and it costs ~3 minutes.
 
-### API conformance
-
-```bash
-.venv/bin/python -m eval.check_server --base-url http://localhost:8765
-```
-
-### Final scoring (the official combined number)
+**Final scoring helper:**
 
 ```bash
 .venv/bin/python -m eval.score \
   --correctness results/correctness_<sha>.json \
-  --throughput results/throughput_<sha>.json
+  --throughput  results/throughput_<sha>.json
 ```
-
-## Throughput-aware metrics at `/metrics`
-
-The engine's `/metrics` endpoint gives you the throughput-relevant
-counters at any point during a run. The per-change loop is:
-**run quick_throughput → diff `/metrics` and `/metrics/regions` against the
-previous snapshot.**
-
-```bash
-curl -s http://localhost:8765/metrics
-```
-
-```json
-{
-  "tok_per_s_recent": 612.4,            # rolling 60s window — "right now"
-  "tok_per_s_lifetime": 549.0,
-  "prompt_tok_per_s_lifetime": 489.0,
-  "completion_tok_per_s_lifetime": 60.1,
-  "batch_tok_per_s_p50": 580.2,         # one batched generate's tok/s
-  "batch_tok_per_s_p99": 720.3,
-  "max_batch": 32,
-  "avg_batch_size": 24.4,
-  "avg_batch_fill": 0.762,              # how full the batches are
-  "running": 0,
-  "waiting": 0,
-  ...
-}
-```
-
-`avg_batch_fill < 0.5` is a clear signal that the batcher is leaving
-throughput on the floor — the window is too short or `num_concurrent` on
-the client side is too low.
-
-`tok_per_s_recent` is the number to watch when iterating. The `/metrics`
-endpoint costs nothing to hit so you can `watch -n 0.5 'curl -s …'`.
 
 ## Profiling — start with the CLI region table
 
-`engine/runtime/profiling.py` defines `RegionTimer`. Wrap any chunk of code
-with `time_region("name")`:
+`engine/runtime/profiling.py` defines `RegionTimer`. Wrap any chunk:
 
 ```python
 from engine.runtime.profiling import time_region
-
 with time_region("moe.grouped_gemm"):
-    out = grouped_gemm(...)
+    ...
 ```
 
-Then dump the table at any time:
+Dump the table any time:
 
 ```bash
 curl -s http://localhost:8765/metrics/regions
 ```
 
-```
-region                                  n    total_s    mean_ms     p50_ms     p99_ms
--------------------------------------------------------------------------------------
-engine.model.generate                  20    160.234   8011.700   7895.123   9876.456
-engine.batch.tokenize                  20      1.234     61.700     58.123    120.456
-engine.batch.render                    20      0.234     11.700     10.123     20.456
-...
-```
+That's the **default** profiling surface. `torch.profiler` is wired but
+reserved for drilling **inside** a region the CLI table has already
+flagged. To capture: launch with `--profile-torch-after-batches N` and
+the engine will one-shot-capture batch N+1 inside
+`torch.profiler.profile`, exporting:
 
-This is the primary feedback loop. Per-change diff = before vs after table.
+- `profiles/torch_<tag>_<ts>.json.gz` — Chrome trace (open in Perfetto)
+- `profiles/torch_<tag>_<ts>.txt` — sorted-by-self-CUDA-time op table
+- `profiles/torch_<tag>_<ts>.summary.json` — top kernels structured (consumed by `refresh_status`)
 
-`torch.profiler` is wired in the same module (`enable_torch_profiler(...)`,
-`--profile-torch --profile-window=10:20`) but reserved for **drilling inside**
-a region the CLI table has already flagged. Don't run with `--profile-torch`
-by default — the overhead and the friction of opening the chrome trace make it
-the wrong tool for the inner loop.
+## Coordinating
 
-## Engine internals (Phase 1)
-
-```
-                   ┌─────────────────────┐
-   request ──────► │ FastAPI handler     │
-                   │ (server/app.py)     │
-                   └──────────┬──────────┘
-                              │ Engine.generate()
-                              ▼
-                   ┌─────────────────────┐
-                   │ asyncio.Queue       │  ◄── Engine._req_queue
-                   └──────────┬──────────┘
-                              │
-                              ▼
-                   ┌─────────────────────┐
-                   │ _batcher_loop       │  background coroutine
-                   │  ── gather batch    │
-                   │     up to N or      │
-                   │     batch_window_ms │
-                   │  ── left-pad        │
-                   │  ── one model.gen() │
-                   │  ── trim @ EOS      │
-                   │  ── set futures     │
-                   └──────────┬──────────┘
-                              │ asyncio.to_thread(...)
-                              ▼
-                   ┌─────────────────────┐
-                   │ HF Qwen3_5MoeFor… │
-                   │ .generate(inputs:[B,L]) │
-                   └─────────────────────┘
-```
-
-- The batcher keys batches on `do_sample` (temperature == 0 vs > 0); same
-  batch shares one `(temperature, top_p)`.
-- `max_new_tokens = max(req.max_tokens for req in batch)`. Each output is
-  trimmed at first EOS / pad before returning, so short answers don't
-  pay for the longest one in `usage.completion_tokens`.
-- Padding is **left** (HF generate requirement). `tok.pad_token` is set
-  to EOS at engine load time if unset.
-
-This is the smallest change that buys real throughput at TP=1 *before*
-we tear out HF's KV cache. It is **not** the final design — Phase 2
-replaces this with a continuous (in-flight) batcher + paged KV +
-DeltaNet per-sequence state cache + TP=8.
-
-## Performance so far (Phase 1, single H200)
-
-| Configuration | Mini GSM8K (20 problems) wall time |
-|---|---|
-| asyncio.Lock + concurrent=2 (no batching) | 168 s |
-| Microbatch=16 + concurrent=8 | 74 s |
-| Microbatch=32 + concurrent=32 | **44 s** |
-
-Full 200-problem gate at microbatch=32 + concurrent=32: **3:01** wall.
-
-### Phase 1 throughput floor (clean, GPU-isolated)
-
-`bench/quick_throughput` defaults at c=16/32/64, 32 reqs/level, no spot
-checks, batch_window=500ms, single H200 (GPU 7, no contention):
-
-| concurrency | tok/s | wall_s | weight |
-|---|---|---|---|
-| 16 | 350 | 124 | 4× |
-| **32** | **694** | **62** | 4× |
-| 64 | 525 | 79 | 8× |
-
-- Partial weighted score (16/22 weight): **8,380**
-- Rough extrapolation to all 7 levels: **~11,500**
-- vLLM baseline rough sum: ~166k weighted → **we're at about 7% of vLLM**
-
-c=64 is *slower* than c=32 — that's the smoking gun for Phase 2. HF's
-static KV cache allocates `[batch, max_seq_len, ...]` per layer. At c=64
-that doubles the per-step memory bandwidth pressure vs c=32 and we're
-already bandwidth-bound. Real paged KV + continuous batching is exactly
-what fixes this; the floor we measure here is what Phase 2 has to beat.
-
-`avg_batch_size` from this run was **14.6** (vs `max_batch=64`) — i.e.
-the static microbatcher is leaving most of the parallelism on the floor
-because the harness's `asyncio.gather` doesn't actually fire 32 requests
-within the 500ms window evenly. Continuous batching makes this moot —
-sequences join the batch as soon as they arrive.
-
-### Region table breakdown (Phase 1 clean run)
-
-| region | n | mean_ms | p50_ms | p99_ms |
-|---|---|---|---|---|
-| `engine.generate` (whole request) | 102 | 65026 | 61380 | 83879 |
-| `engine.model.generate` (one batch) | 7 | 48678 | 39348 | 83337 |
-| `engine.batch.tokenize` | 7 | 27 | 20 | 61 |
-| `engine.batch.render` | 7 | 13 | 5 | 69 |
-| `engine.batch.decode` | 7 | 9 | 7 | 28 |
-
-The batching scaffolding is **0.3% of batch time** — it's pure model
-forward time at this stage. Avg batch size 24.4 (concurrent=32 doesn't
-fully fill because requests trickle in). Phase 2 attacks the model.generate
-slab via TP=8 + paged KV + continuous batching + CUDA graphs.
-
-These are correctness-iteration numbers, not the final throughput numbers
-we'll be scored on. The throughput sweep at high concurrency (where
-scoring weight is highest) lives in Phase 2 onward.
-
-## What's NOT done yet (and where to start)
-
-In rough priority order:
-
-1. **TP=8 + continuous batching**. The single biggest perf gap. This
-   is the bulk of Phase 2. See the plan section in HACKING for the
-   sub-tasks (paged KV, DeltaNet state cache, FA2 paged-decode, scheduler).
-2. **Real throughput sweep**. We have not yet run
-   `eval/throughput/run_throughput.py` end-to-end against our engine.
-   Doing so will give us our first "where do we stand vs vLLM baseline"
-   number — useful as a clean Phase 1 floor before Phase 2 work begins.
-3. **Multi-GPU eval parallelism for fast iteration**. We have 8 GPUs
-   sitting idle. Running 4 engine instances on 4 GPUs and sharding the
-   harness across them would drop the gate eval from ~7 min to ~2 min.
-   Easy follow-up if iteration speed pinches.
-4. **Helion kernels** (Phase 3). We'll need `helion-docs` and
-   `helion-perf` knowledge for this — deferred until the Phase 2 scaffolding
-   is in place and the CLI region table tells us which kernel to write first.
-
-## Coordinating with each other
-
-- **Server port**: I run on `8765` to leave `8000` for whoever wants the
-  default. You'll see `mghanmi` running on `8000` too — heads up.
-- **Weights cache**: `/mnt/data/$USER/models/Qwen3.5-35B-A3B`. Don't
-  re-download into a shared dir without coordinating.
-- **Branches**: feel free to branch off `main`. The codebase is small
-  enough that big-bang merges are fine.
-- **Profiling artifacts**: `profiles/` is gitignored except for its
-  README. Drop your CLI region tables there using the naming convention
-  in `profiles/README.md` — `regions_phaseX_<scenario>_<sha>_<ts>.txt`.
+- **Server port**: I use `8765`. Teammate `mghanmi` uses `8000`. Pick a free port.
+- **GPU**: pick a low-contention index with `nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv`.
+- **Weights cache**: `/mnt/data/$USER/models/Qwen3.5-35B-A3B`.
+- **Profiles**: `profiles/` is gitignored except the README and the structured `*.summary.json` files. Drop your captures there.
