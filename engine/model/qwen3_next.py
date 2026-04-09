@@ -89,6 +89,8 @@ def load_model(
     device: str | torch.device = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
     attn_impl: str = "sdpa",
+    tp: int = 1,
+    ep: int = 1,
 ) -> LoadedModel:
     """Load Qwen3.5-35B-A3B as a text-only causal LM.
 
@@ -130,6 +132,21 @@ def load_model(
     log.info("loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
 
+    # From-scratch TP: torchrun launches one process per GPU. Each rank loads
+    # the FULL model onto its own GPU, then we slice specific Linear weights
+    # in-place via engine.model.tp_shard.apply_tensor_parallel. No HF tp_plan,
+    # no DTensor, no accelerate — just torch.distributed all-reduce.
+    tp_rank = 0
+    if tp and tp > 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = f"cuda:{local_rank}"
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        from engine.model.tp_shard import init_tp_process_group
+        tp_rank, world_size = init_tp_process_group()
+        log.info("tp=%d local_rank=%d rank=%d world_size=%d", tp, local_rank, tp_rank, world_size)
+        assert world_size == tp, f"torchrun world_size={world_size} != --tp {tp}"
+
     target_device = torch.device(device)
 
     # Strategy 1: instantiate Qwen3_5MoeForCausalLM directly. transformers will
@@ -141,14 +158,21 @@ def load_model(
             "upgrade transformers (>=5.5) or vendor the modeling code."
         )
 
-    log.info("loading Qwen3_5MoeForCausalLM (text-only) dtype=%s attn_impl=%s", dtype, attn_impl)
+    log.info("loading Qwen3_5MoeForCausalLM (text-only) dtype=%s attn_impl=%s tp=%d", dtype, attn_impl, tp)
+    # Every rank loads the FULL model onto its own GPU (device_map points at
+    # the rank-local device). We then shard attention q/k/v/o and shared_expert
+    # in place via apply_tensor_parallel(). NO HF tp_plan.
+    load_kwargs: dict[str, Any] = dict(
+        dtype=dtype,
+        attn_implementation=attn_impl,
+        device_map={"": target_device},
+    )
+
     try:
         model = CausalCls.from_pretrained(
             model_name_or_path,
             config=text_cfg,
-            dtype=dtype,
-            attn_implementation=attn_impl,
-            device_map={"": target_device},
+            **load_kwargs,
         )
         log.info("loaded text-only causal LM")
     except Exception as e:
@@ -158,9 +182,7 @@ def load_model(
             raise
         full = CondCls.from_pretrained(
             model_name_or_path,
-            dtype=dtype,
-            attn_implementation=attn_impl,
-            device_map={"": target_device},
+            **load_kwargs,
         )
         # The multimodal model nests the text LM under a known attribute. Try
         # the common names; whatever works, that's our model.
@@ -173,6 +195,29 @@ def load_model(
         else:
             log.warning("could not extract text branch — using full multimodal model")
             model = full
+
+    # Apply from-scratch TP sharding AFTER load. Each rank slices its piece of
+    # q/k/v/o + shared_expert gate/up/down in-place; the unsharded originals
+    # are freed via contiguous().clone() + empty_cache below.
+    if tp and tp > 1:
+        from engine.model.tp_shard import apply_tensor_parallel
+        apply_tensor_parallel(model, tp_size=tp, tp_rank=tp_rank)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log.info("tp sharding applied (rank=%d)", tp_rank)
+
+    # Expert Parallelism (forward-only): each rank loads the FULL model but
+    # only runs its slice of experts in the MoE forward. Replaces the HF
+    # Qwen3NextSparseMoeBlock.forward via monkey-patch. See engine/runtime/ep.py.
+    if ep and ep > 1:
+        from engine.runtime.ep import init_ep, patch_moe_for_ep
+        ep_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        ep_rank_env = int(os.environ.get("RANK", str(ep_local_rank)))
+        ep_world = int(os.environ.get("WORLD_SIZE", str(ep)))
+        assert ep_world == ep, f"torchrun WORLD_SIZE={ep_world} != --ep {ep}"
+        rank_id, world_size = init_ep(ep_world, ep_rank_env, local_rank=ep_local_rank)
+        patched = patch_moe_for_ep(model, rank_id, world_size)
+        log.info("ep=%d rank=%d patched %d MoE blocks", ep, rank_id, patched)
 
     model.eval()
     return LoadedModel(

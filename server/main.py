@@ -29,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--tp", type=int, default=1, help="tensor parallel size")
+    p.add_argument(
+        "--ep",
+        type=int,
+        default=1,
+        help="expert parallel size. When >1, launch with torchrun "
+        "--nproc_per_node=EP. Each rank loads full weights but only runs its "
+        "slice of experts in the MoE forward; routed contribution is all-reduced. "
+        "Only rank 0 binds --port; other ranks run an EP worker loop.",
+    )
     p.add_argument("--max-batch", type=int, default=64)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument(
@@ -103,6 +112,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     args = parse_args()
 
+    # Expert-parallel aware: under torchrun, WORLD_SIZE / RANK / LOCAL_RANK
+    # are set by the launcher. Only rank 0 binds HTTP. Non-zero ranks load
+    # the same engine and enter a passive worker loop so they participate
+    # in the MoE all_reduce collectives driven by rank 0's forwards.
+    import os as _os_main
+    _ep_world = int(_os_main.environ.get("WORLD_SIZE", "1"))
+    _ep_rank = int(_os_main.environ.get("RANK", "0"))
+    _ep_local_rank = int(_os_main.environ.get("LOCAL_RANK", "0"))
+    if args.ep > 1 and _ep_world > 1:
+        args.device = f"cuda:{_ep_local_rank}"
+
     if args.profile_torch or args.profile_torch_after_batches > 0:
         enable_torch_profiler(tag=args.profile_tag)
 
@@ -114,6 +134,7 @@ def main() -> None:
         args.model,
         stub=args.stub,
         tp=args.tp,
+        ep=args.ep,
         max_batch=args.max_batch,
         max_model_len=args.max_model_len,
         device=args.device,
@@ -128,6 +149,29 @@ def main() -> None:
 
     if args.metrics_interval > 0:
         metrics.start_flusher(interval_s=args.metrics_interval)
+
+    # EP: only rank 0 serves HTTP. Non-zero ranks enter a passive worker
+    # loop that blocks on collectives driven by rank 0's forwards. The
+    # worker loop is necessarily simple — it waits for rank 0 to broadcast
+    # a wake/stop signal; in between it sits on torch.distributed.barrier.
+    #
+    # IMPORTANT: the current EP patch does NOT broadcast inputs from rank 0
+    # to worker ranks, so worker ranks cannot actually run the model forward
+    # in lockstep. A full implementation needs rank 0 to broadcast each
+    # forward's inputs (hidden_states at the MoE block boundary) or drive
+    # the same batch on every rank via an input-tensor broadcast at the top
+    # of the scheduler step. Until that lands, the worker loop below is a
+    # BLOCKING PLACEHOLDER: rank 0 will hang on the first MoE all_reduce
+    # because workers aren't participating.
+    if args.ep > 1 and _ep_rank != 0:
+        log.info("EP worker rank=%d: model loaded, entering passive barrier loop", _ep_rank)
+        try:
+            import torch.distributed as _dist
+            while True:
+                _dist.barrier()
+        except KeyboardInterrupt:
+            pass
+        return
 
     app = create_app(engine)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

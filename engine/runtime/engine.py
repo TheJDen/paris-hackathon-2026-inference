@@ -77,6 +77,7 @@ class Engine:
         *,
         stub: bool = False,
         tp: int = 1,
+        ep: int = 1,
         max_batch: int = 64,
         max_model_len: int = 4096,
         device: str = "cuda:0",
@@ -92,6 +93,7 @@ class Engine:
         self.model_name = model_name
         self.stub = stub
         self.tp = tp
+        self.ep = ep
         self.max_batch = max_batch
         self.max_model_len = max_model_len
         self.device = device
@@ -153,6 +155,7 @@ class Engine:
                 device=self.device,
                 attn_impl=self.attn_impl,
                 tp=self.tp,
+                ep=self.ep,
             )
         self._loaded = loaded
 
