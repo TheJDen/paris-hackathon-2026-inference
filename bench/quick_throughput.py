@@ -43,18 +43,22 @@ import urllib.error
 import urllib.request
 
 # Reuse the official harness internals so we measure the same thing it does.
+import aiohttp
+
 from eval.score import CONCURRENCY_WEIGHTS
 from eval.throughput.run_throughput import (
     INPUT_TOKENS,
     MODEL_ID,
     OUTPUT_TOKENS,
+    SPOT_CHECKS,
     generate_prompts,
     run_benchmark,
+    run_concurrency_level,
 )
 
 DEFAULT_QUICK_LEVELS = [16, 32, 64]
-DEFAULT_QUICK_REQUESTS = 16
-DEFAULT_NUM_PROMPTS = 64
+DEFAULT_QUICK_REQUESTS = 32
+DEFAULT_NUM_PROMPTS = 128
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +77,15 @@ def parse_args() -> argparse.Namespace:
         "--num-requests",
         type=int,
         default=DEFAULT_QUICK_REQUESTS,
-        help="requests per concurrency level (default: 16; full eval uses 64)",
+        help="requests per concurrency level (default: 32; full eval uses 64)",
+    )
+    p.add_argument(
+        "--with-spot-checks",
+        action="store_true",
+        help="include the 2 math spot-checks per level (off by default — they "
+        "fragment the batches into greedy+sampled sub-batches and add noise to "
+        "the iteration signal). Use this when running pre-merge to mirror the "
+        "official harness exactly.",
     )
     p.add_argument("--num-prompts", type=int, default=DEFAULT_NUM_PROMPTS)
     p.add_argument("--input-tokens", type=int, default=INPUT_TOKENS)
@@ -91,6 +103,40 @@ def parse_args() -> argparse.Namespace:
         help="skip the /metrics/regions fetch at the end",
     )
     return p.parse_args()
+
+
+async def _sweep_no_spot(
+    base_url: str,
+    prompts: list[str],
+    concurrency_levels: list[int],
+    num_requests: int,
+    max_tokens: int,
+    tokenizer,
+) -> list[dict]:
+    """Like run_benchmark but with spot_checks=[].
+
+    Spot checks fragment the iteration signal because they have temperature=0
+    and the engine batches them separately from the throughput prompts which
+    use temperature=1. For per-change iteration we want a clean number.
+    """
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    timeout = aiohttp.ClientTimeout(total=600)
+    results: list[dict] = []
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for c in concurrency_levels:
+            print(f"  Concurrency={c} ({num_requests} requests)...", end=" ", flush=True)
+            r = await run_concurrency_level(
+                session, url, prompts, c, num_requests, max_tokens, tokenizer, []
+            )
+            parts = [
+                f"{r['throughput_tok_per_sec']} tok/s",
+                f"({r['successful_requests']}/{num_requests} ok, {r['wall_time_sec']}s)",
+            ]
+            if r["token_discrepancy"]:
+                parts.append("[WARN: token count mismatch]")
+            print(" ".join(parts))
+            results.append(r)
+    return results
 
 
 def fetch_regions(base_url: str) -> str | None:
@@ -177,18 +223,31 @@ def main() -> None:
     print(f"generating {args.num_prompts} random prompts of {args.input_tokens} tokens...")
     prompts = generate_prompts(tokenizer, args.num_prompts, args.input_tokens)
 
+    print(f"spot checks: {'on (correctness mirroring)' if args.with_spot_checks else 'off (iteration mode)'}")
     print("sweeping...")
     t0 = time.perf_counter()
-    results = asyncio.run(
-        run_benchmark(
-            args.base_url,
-            prompts,
-            list(args.concurrency),
-            args.num_requests,
-            args.max_tokens,
-            tokenizer,
+    if args.with_spot_checks:
+        results = asyncio.run(
+            run_benchmark(
+                args.base_url,
+                prompts,
+                list(args.concurrency),
+                args.num_requests,
+                args.max_tokens,
+                tokenizer,
+            )
         )
-    )
+    else:
+        results = asyncio.run(
+            _sweep_no_spot(
+                args.base_url,
+                prompts,
+                list(args.concurrency),
+                args.num_requests,
+                args.max_tokens,
+                tokenizer,
+            )
+        )
     elapsed = time.perf_counter() - t0
     all_levels = sorted(args.concurrency) == [1, 2, 4, 8, 16, 32, 64]
     print_summary(results, elapsed, all_levels=all_levels)

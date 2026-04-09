@@ -385,15 +385,42 @@ DeltaNet per-sequence state cache + TP=8.
 
 Full 200-problem gate at microbatch=32 + concurrent=32: **3:01** wall.
 
-From the post-gate region table:
+### Phase 1 throughput floor (clean, GPU-isolated)
+
+`bench/quick_throughput` defaults at c=16/32/64, 32 reqs/level, no spot
+checks, batch_window=500ms, single H200 (GPU 7, no contention):
+
+| concurrency | tok/s | wall_s | weight |
+|---|---|---|---|
+| 16 | 350 | 124 | 4× |
+| **32** | **694** | **62** | 4× |
+| 64 | 525 | 79 | 8× |
+
+- Partial weighted score (16/22 weight): **8,380**
+- Rough extrapolation to all 7 levels: **~11,500**
+- vLLM baseline rough sum: ~166k weighted → **we're at about 7% of vLLM**
+
+c=64 is *slower* than c=32 — that's the smoking gun for Phase 2. HF's
+static KV cache allocates `[batch, max_seq_len, ...]` per layer. At c=64
+that doubles the per-step memory bandwidth pressure vs c=32 and we're
+already bandwidth-bound. Real paged KV + continuous batching is exactly
+what fixes this; the floor we measure here is what Phase 2 has to beat.
+
+`avg_batch_size` from this run was **14.6** (vs `max_batch=64`) — i.e.
+the static microbatcher is leaving most of the parallelism on the floor
+because the harness's `asyncio.gather` doesn't actually fire 32 requests
+within the 500ms window evenly. Continuous batching makes this moot —
+sequences join the batch as soon as they arrive.
+
+### Region table breakdown (Phase 1 clean run)
 
 | region | n | mean_ms | p50_ms | p99_ms |
 |---|---|---|---|---|
-| `engine.generate` (whole request) | 220 | 24407 | 18654 | 41147 |
-| `engine.model.generate` (one batch) | 9 | 23575 | 18551 | 36992 |
-| `engine.batch.tokenize` | 9 | 35 | 39 | 61 |
-| `engine.batch.render` | 9 | 22 | 27 | 32 |
-| `engine.batch.decode` | 9 | 8 | 10 | 14 |
+| `engine.generate` (whole request) | 102 | 65026 | 61380 | 83879 |
+| `engine.model.generate` (one batch) | 7 | 48678 | 39348 | 83337 |
+| `engine.batch.tokenize` | 7 | 27 | 20 | 61 |
+| `engine.batch.render` | 7 | 13 | 5 | 69 |
+| `engine.batch.decode` | 7 | 9 | 7 | 28 |
 
 The batching scaffolding is **0.3% of batch time** — it's pure model
 forward time at this stage. Avg batch size 24.4 (concurrent=32 doesn't
