@@ -28,3 +28,5 @@ profiles/*
 # Server runtime artifacts
 server.log
 results/
+
+weights/*
