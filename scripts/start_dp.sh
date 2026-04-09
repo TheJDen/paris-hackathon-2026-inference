@@ -70,6 +70,8 @@ for i in $(seq 0 $((NUM_RANKS - 1))); do
         --device cuda:0 \
         --max-batch "$MAX_BATCH" \
         --max-model-len "$MAX_MODEL_LEN" \
+        --no-torch-compile \
+        --no-cuda-graphs \
         $EXTRA_ARGS \
         >> "rank${i}.dp.log" 2>&1 &
     disown $! 2>/dev/null || true
