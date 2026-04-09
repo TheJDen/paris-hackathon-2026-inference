@@ -185,18 +185,22 @@ class Engine:
             ),
         )
 
-        # Prefix cache: reserve the last slot for the shared chat-template
-        # prefix so it is never handed out to normal requests.
-        self.prefix_cache = PrefixCache(
-            cache=self.runner.cache,
-            num_slots=self.max_batch,
-        )
+        # Prefix cache: TEMPORARILY DISABLED — interacts badly with batched
+        # prefill (tensor shape mismatch from the 3-token shift). 3 tokens of
+        # savings is negligible, will re-enable after debugging.
+        self.prefix_cache = None
+        if False:  # disabled
+            self.prefix_cache = PrefixCache(
+                cache=self.runner.cache,
+                num_slots=self.max_batch,
+            )
         # Remove the reserved slot from the scheduler's free pool so it is
         # never assigned to a regular request.
-        reserved = self.prefix_cache.RESERVED_SLOT
-        if reserved in self.scheduler.free_slots:
-            self.scheduler.free_slots.remove(reserved)
-            log.info("prefix_cache: removed slot %d from scheduler free pool", reserved)
+        if self.prefix_cache is not None:
+            reserved = self.prefix_cache.RESERVED_SLOT
+            if reserved in self.scheduler.free_slots:
+                self.scheduler.free_slots.remove(reserved)
+                log.info("prefix_cache: removed slot %d from scheduler free pool", reserved)
 
         # Warm up: one-time prefill of the prefix into the reserved slot.
         # We need the tokenizer's raw encode function (no chat template).
@@ -219,14 +223,15 @@ class Engine:
             ) if hasattr(self.tokenizer.tok, "apply_chat_template") else ""
             return self._loaded.tokenizer.encode(text, add_special_tokens=False)
 
-        try:
-            self.prefix_cache.warm_up(
-                runner=self.runner,
-                tokenizer_encode_fn=_raw_encode,
-            )
-        except Exception as exc:
-            log.exception("prefix_cache warm_up failed (%s); continuing without it", exc)
-            self.prefix_cache = None
+        if self.prefix_cache is not None:
+            try:
+                self.prefix_cache.warm_up(
+                    runner=self.runner,
+                    tokenizer_encode_fn=_raw_encode,
+                )
+            except Exception as exc:
+                log.exception("prefix_cache warm_up failed (%s); continuing without it", exc)
+                self.prefix_cache = None
 
         # Pass the prefix cache reference to the scheduler so admit can use it.
         if self.prefix_cache is not None:
