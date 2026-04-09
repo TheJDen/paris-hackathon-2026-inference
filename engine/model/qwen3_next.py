@@ -112,6 +112,17 @@ def load_model(
     except Exception as e:
         log.warning("delta_rule helion monkeypatch import failed: %s", e)
 
+    # Apply the fused MoE dispatch patch (Helion histogram+permutation +
+    # grouped SwiGLU). PARIS_DISABLE_HELION_MOE=1 to disable.
+    import os as _os
+    if _os.environ.get("PARIS_DISABLE_HELION_MOE", "0") != "1":
+        try:
+            from engine.kernels.patch import patch_qwen3_5_moe
+            patch_qwen3_5_moe()
+            log.info("moe dispatch helion monkeypatch: applied")
+        except Exception as e:
+            log.warning("could not apply fused MoE patch: %s", e)
+
     log.info("loading config from %s", model_name_or_path)
     full_cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     text_cfg = getattr(full_cfg, "text_config", full_cfg)
