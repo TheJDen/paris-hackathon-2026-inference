@@ -229,10 +229,20 @@ class Scheduler:
             if self.running and not should_prefill:
                 with time_region("scheduler.decode_step"):
                     self._steps_since_prefill += 1
-                    slot_ids = sorted(self.running.keys())
-                    seqs = [self.running[s] for s in slot_ids]
-                    last_tokens = [s.output_token_ids[-1] for s in seqs]
-                    cache_lengths = [s.total_len - 1 for s in seqs]
+                    # Single pass over self.running: build all four lists
+                    # together instead of sorted() + 3 list comprehensions +
+                    # per-item dict lookups. Dict insertion order is stable
+                    # and the runner keys into slot_ids[] explicitly, so
+                    # ordering is fine.
+                    slot_ids: list[int] = []
+                    seqs: list[Sequence] = []
+                    last_tokens: list[int] = []
+                    cache_lengths: list[int] = []
+                    for sid, s in self.running.items():
+                        slot_ids.append(sid)
+                        seqs.append(s)
+                        last_tokens.append(s.output_token_ids[-1])
+                        cache_lengths.append(s.total_len - 1)
                     # cache_lengths is the absolute position of the next
                     # token. Right now slot has prompt + output_len tokens
                     # cached, the new token will land at index total_len-1

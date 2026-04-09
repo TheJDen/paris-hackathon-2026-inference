@@ -116,6 +116,24 @@ from typing import Callable, NamedTuple
 
 import torch
 
+# Graph-safe torch reference implementations for the linear-attention fast
+# paths.  We patch each Qwen3NextGatedDeltaNet INSTANCE's bound method
+# references to these during capture + replay so that:
+#   * causal_conv1d_update — no Triton kernel, pure torch.nn.functional.
+#   * recurrent_gated_delta_rule — no fla Triton kernel, pure torch loop.
+# Both are importable from the HF modeling module; they exist precisely as
+# the CPU/fallback path.
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import (
+        torch_causal_conv1d_update as _torch_causal_conv1d_update,
+        torch_recurrent_gated_delta_rule as _torch_recurrent_gated_delta_rule,
+        torch_chunk_gated_delta_rule as _torch_chunk_gated_delta_rule,
+    )
+except Exception:  # pragma: no cover - import-time defensive
+    _torch_causal_conv1d_update = None
+    _torch_recurrent_gated_delta_rule = None
+    _torch_chunk_gated_delta_rule = None
+
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +151,109 @@ def _bucket_for(batch_size: int) -> int:
         f"batch_size={batch_size} exceeds max bucket {BUCKETS[-1]}. "
         f"Add a larger bucket to BUCKETS."
     )
+
+
+def _torch_rmsnorm_gated_forward(weight, eps, hidden_states, gate=None):
+    """Pure-torch reference matching Qwen3NextRMSNormGated.forward.
+
+    Used to replace fla's FusedRMSNormGated Triton kernel during graph
+    capture, which would otherwise hit cudaErrorStreamCaptureUnsupported.
+    """
+    import torch.nn.functional as F
+
+    input_dtype = hidden_states.dtype
+    hs = hidden_states.to(torch.float32)
+    variance = hs.pow(2).mean(-1, keepdim=True)
+    hs = hs * torch.rsqrt(variance + eps)
+    hs = weight * hs.to(input_dtype)
+    if gate is not None:
+        hs = hs * F.silu(gate.to(torch.float32))
+    return hs.to(input_dtype)
+
+
+def _patch_delta_net_instances(inner_model) -> list[tuple[object, str, object]]:
+    """Swap each Qwen3NextGatedDeltaNet instance's bound fast-path functions
+    to the pure-torch references so that capture AND replay never touch
+    Triton / fla kernels on the decode hot path.
+
+    The HF module captures its fast-path function references at
+    ``__init__`` time as ``self.chunk_gated_delta_rule``,
+    ``self.recurrent_gated_delta_rule``, ``self.causal_conv1d_update``.
+    Module-level monkeypatching therefore has NO effect on already-built
+    layers.  We walk the live module tree and rebind the attributes on
+    each instance directly.
+
+    Returns a list of ``(module, attr_name, original_value)`` tuples that
+    the caller can pass to :func:`_restore_delta_net_instances` to undo.
+    """
+    saved: list[tuple[object, str, object]] = []
+    if (
+        _torch_causal_conv1d_update is None
+        or _torch_recurrent_gated_delta_rule is None
+    ):
+        log.warning(
+            "graph-capture: HF torch fallbacks not importable; CUDA graph "
+            "capture will almost certainly fail on the linear-attention "
+            "layers.  Rebuild transformers or disable CUDA graphs."
+        )
+        return saved
+
+    patches = {
+        "causal_conv1d_update": _torch_causal_conv1d_update,
+        "recurrent_gated_delta_rule": _torch_recurrent_gated_delta_rule,
+        # chunk path is only used for prefill (seq_len > 1); decode takes the
+        # recurrent branch.  We patch it too in case warmup hits seq_len==1
+        # with no prior state (first-ever forward), which would fall through
+        # the chunk branch.
+        "chunk_gated_delta_rule": _torch_chunk_gated_delta_rule
+        if _torch_chunk_gated_delta_rule is not None
+        else None,
+    }
+
+    count = 0
+    for _name, m in inner_model.named_modules():
+        if type(m).__name__ != "Qwen3NextGatedDeltaNet":
+            continue
+        count += 1
+        for attr, replacement in patches.items():
+            if replacement is None or not hasattr(m, attr):
+                continue
+            saved.append((m, attr, getattr(m, attr)))
+            setattr(m, attr, replacement)
+        # Also replace ``m.norm`` if it is an fla FusedRMSNormGated module.
+        # The fla variant calls a Triton kernel that autotunes / host-syncs
+        # and is not graph-capture-safe.  We override its ``forward`` with
+        # the pure-torch reference, closing over the live weight/eps.
+        norm = getattr(m, "norm", None)
+        if norm is not None and type(norm).__name__ == "FusedRMSNormGated":
+            w = norm.weight
+            eps = getattr(norm, "eps", getattr(norm, "variance_epsilon", 1e-6))
+
+            def _patched_norm_forward(
+                hidden_states, gate=None, _w=w, _eps=eps
+            ):
+                return _torch_rmsnorm_gated_forward(_w, _eps, hidden_states, gate)
+
+            saved.append((norm, "forward", norm.forward))
+            norm.forward = _patched_norm_forward  # type: ignore[method-assign]
+
+    log.info(
+        "graph-capture: patched %d Qwen3NextGatedDeltaNet instance(s) "
+        "to torch fallbacks (%d attribute rebinds)",
+        count,
+        len(saved),
+    )
+    return saved
+
+
+def _restore_delta_net_instances(saved: list[tuple[object, str, object]]) -> None:
+    for m, attr, original in saved:
+        setattr(m, attr, original)
+    if saved:
+        log.info(
+            "graph-capture: restored %d Qwen3NextGatedDeltaNet attribute(s)",
+            len(saved),
+        )
 
 
 @contextlib.contextmanager
@@ -301,6 +422,15 @@ class DecodeGraphCache:
     # public API
     # ------------------------------------------------------------------ #
 
+    def _activate_linear_layers_for_bucket(self, bucket: int) -> None:
+        """Make every linear-attention layer in the cache point its active
+        conv/recurrent attributes at the bucket's persistent buffers."""
+        from engine.runtime.kv_cache import _LinearAttentionSlotLayer
+
+        for layer in self.cache.layers:
+            if isinstance(layer, _LinearAttentionSlotLayer):
+                layer.activate_graph_bucket(bucket)
+
     def replay(
         self,
         batch_size: int,
@@ -310,7 +440,14 @@ class DecodeGraphCache:
     ) -> torch.Tensor:
         """Run the decode forward via CUDA graph replay.
 
-        Captures the graph for this batch-size bucket on first call.
+        Expects the runner to have already called ``cache.set_batch(...)``
+        with the REAL-sized ``BatchSlots`` (B rows, not padded).  We then
+        rebuild a bucket-padded ``BatchSlots`` and re-run ``set_batch`` so
+        the linear-attention layers gather into the bucket's persistent
+        CUDA-graph buffers.  The full-attention ``update()`` path also
+        reads ``self.cache.batch`` at forward time; the padded view has
+        the same real rows in slots [0:B] and dummy rows that replicate
+        row 0 (same slot, kv_len, position), which is idempotent.
 
         Returns logits of shape [batch_size, vocab_size] — real rows only,
         dummy padding rows are sliced off.
@@ -323,36 +460,93 @@ class DecodeGraphCache:
 
         B_bucket = entry.bucket
 
+        # --- build the bucket-padded BatchSlots and re-set the cache -----
+        # The runner already called set_batch with real B rows; that ran
+        # gather_for_batch in EAGER mode (clones).  We now switch every
+        # linear layer into graph mode for this bucket and re-run set_batch
+        # with a padded BatchSlots so the gather writes into the persistent
+        # buffers the captured graph references.
+        assert self.cache.batch is not None, "runner must call cache.set_batch before replay"
+        real_batch = self.cache.batch
+
+        from engine.runtime.kv_cache import BatchSlots
+
+        if B_bucket == batch_size:
+            padded_batch = real_batch
+        else:
+            pad_n = B_bucket - batch_size
+            # Repeat row 0 for dummy rows (same slot, same kv_len, same
+            # write_positions, same query_len).  Dummy rows compute the
+            # same thing as row 0 → idempotent scatter.
+            pad_slot_ids = torch.cat(
+                [real_batch.slot_ids, real_batch.slot_ids[:1].expand(pad_n)],
+                dim=0,
+            )
+            pad_query_lens = torch.cat(
+                [real_batch.query_lens, real_batch.query_lens[:1].expand(pad_n)],
+                dim=0,
+            )
+            pad_kv_seq_lens = torch.cat(
+                [real_batch.kv_seq_lens, real_batch.kv_seq_lens[:1].expand(pad_n)],
+                dim=0,
+            )
+            pad_write_positions = list(real_batch.write_positions) + [
+                real_batch.write_positions[0] for _ in range(pad_n)
+            ]
+            padded_batch = BatchSlots(
+                slot_ids=pad_slot_ids,
+                write_positions=pad_write_positions,
+                query_lens=pad_query_lens,
+                kv_seq_lens=pad_kv_seq_lens,
+                is_prefill=False,
+            )
+
+        # Activate graph-mode persistent buffers for every linear-attn layer
+        # for THIS bucket, then re-run set_batch so gather_for_batch copies
+        # into those persistent buffers.
+        self._activate_linear_layers_for_bucket(B_bucket)
+        self.cache.set_batch(padded_batch)
+
         # --- copy real rows into static input buffers ---
         entry.buf_input_ids[:batch_size].copy_(input_ids)
-        # Pad extra rows: repeat slot 0's input (any valid token works).
         if batch_size < B_bucket:
-            entry.buf_input_ids[batch_size:].copy_(input_ids[:1].expand(B_bucket - batch_size, -1))
+            entry.buf_input_ids[batch_size:].copy_(
+                input_ids[:1].expand(B_bucket - batch_size, -1)
+            )
 
-        # attention_mask: real rows from caller, dummy rows get mask=[1,0,...,0]
-        # (position 0 is always valid for slot 0; this keeps causal attn healthy).
+        # attention_mask: real rows from caller, dummy rows mirror row 0.
         max_s = attention_mask.shape[1]
         entry.buf_attention_mask.zero_()
         entry.buf_attention_mask[:batch_size, :max_s].copy_(attention_mask)
         if batch_size < B_bucket:
-            # Dummy rows: attend to position 0 only (slot 0, kv_len=1).
-            entry.buf_attention_mask[batch_size:, 0] = 1
+            entry.buf_attention_mask[batch_size:, :max_s].copy_(
+                attention_mask[:1].expand(B_bucket - batch_size, -1)
+            )
 
         entry.buf_position_ids[:batch_size].copy_(position_ids)
         if batch_size < B_bucket:
-            entry.buf_position_ids[batch_size:].zero_()  # pos 0 for dummies
+            entry.buf_position_ids[batch_size:].copy_(
+                position_ids[:1].expand(B_bucket - batch_size, -1)
+            )
 
         # --- replay ---
-        # Synchronize so the copy_() ops above are visible to the capture
-        # stream before replay begins.
-        torch.cuda.current_stream(self.device).synchronize()
         entry.graph.replay()
 
-        # scatter linear-attention views back to the pool — must happen AFTER
-        # replay so the mutated conv/recurrent states are committed.
-        # NOTE: set_batch was called by the runner BEFORE replay(); commit_batch
-        # is our responsibility here since we replaced the eager forward.
+        # Scatter the (now mutated) persistent buffers back into the pool.
+        # commit_batch uses self.cache.batch which is the padded batch; the
+        # dummy rows write to their replicated slot (same value) — idempotent.
         self.cache.commit_batch()
+
+        # Leave graph mode so subsequent eager code paths (prefill, other
+        # non-graph decode) see the clone-based fast path.  The persistent
+        # buffers themselves remain alive on the layers (they're held by
+        # ``_graph_conv_bufs`` / ``_graph_rec_bufs`` dicts) so the captured
+        # graph still references valid memory when the next replay runs.
+        from engine.runtime.kv_cache import _LinearAttentionSlotLayer
+
+        for layer in self.cache.layers:
+            if isinstance(layer, _LinearAttentionSlotLayer):
+                layer.deactivate_graph_mode()
 
         # Return only the real rows (slice off padding).
         return entry.buf_logits[:batch_size].clone()
@@ -425,15 +619,26 @@ class DecodeGraphCache:
         # ---- Warmup (outside graph, no_grad) ----
         # Two passes: first triggers Triton/fla JIT, second confirms stable state.
         #
-        # IMPORTANT: warmup AND capture must run with the delta-rule call sites
-        # patched to the pure-torch fallback.  fla's (and our Helion rewrite's)
-        # Triton kernels call host-visible sync / autotune benchmarking that
-        # raises ``cudaErrorStreamCaptureUnsupported`` inside ``torch.cuda.graph``.
-        # The fallback is stock PyTorch and captures cleanly.  We patch across
-        # warmup so the bf16 → fp32 cast shapes the fallback produces are what
-        # the downstream layers see during capture as well (stable pool writes).
-        _delta_patch = _graph_safe_delta_rule()
-        _delta_patch.__enter__()
+        # IMPORTANT: warmup AND capture must run with every
+        # Qwen3NextGatedDeltaNet INSTANCE's fast-path functions patched to the
+        # pure-torch fallbacks.  fla's (and our Helion rewrite's) Triton
+        # kernels call host-visible sync / autotune benchmarking that raises
+        # ``cudaErrorStreamCaptureUnsupported`` inside ``torch.cuda.graph``.
+        # Module-level monkeypatching does NOT work because
+        # ``Qwen3NextGatedDeltaNet.__init__`` captures the function REFERENCES
+        # at construction time (``self.chunk_gated_delta_rule = ...``,
+        # ``self.recurrent_gated_delta_rule = ...``,
+        # ``self.causal_conv1d_update = ...``), so we walk the module tree
+        # and rebind each instance attribute directly.
+        #
+        # ALSO: every linear-attention cache layer must be in "graph mode"
+        # for this bucket so that ``gather_for_batch`` copies state into the
+        # PERSISTENT conv/recurrent buffers the captured graph will reference.
+        # Without this, each decode step allocates fresh clones at new
+        # addresses and the captured graph's kernel-arg pointers become stale
+        # on the next replay (cudaErrorStreamCaptureInvalidated).
+        saved_instance_patches = _patch_delta_net_instances(self.inner_model)
+        self._activate_linear_layers_for_bucket(bucket)
         try:
             with torch.no_grad():
                 for warmup_i in range(2):
@@ -489,9 +694,18 @@ class DecodeGraphCache:
             torch.cuda.synchronize(device)
             log.info("CUDA graph capture complete: bucket=%d", bucket)
         finally:
-            # Restore fla/Helion chunk_gated_delta_rule bindings — eager code
-            # after this point (e.g. prefill) can use the fast path again.
-            _delta_patch.__exit__(None, None, None)
+            # Restore the original fla / Helion / causal_conv1d bindings on
+            # each layer instance so that EAGER decode and PREFILL after
+            # capture use the fast kernels.  Replay does not call Python, so
+            # the captured graph is unaffected by this restoration.
+            _restore_delta_net_instances(saved_instance_patches)
+            # Return the linear-attn layers to eager (clone-based) mode so
+            # prefill and other non-graph code paths work normally.
+            from engine.runtime.kv_cache import _LinearAttentionSlotLayer
+
+            for layer in self.cache.layers:
+                if isinstance(layer, _LinearAttentionSlotLayer):
+                    layer.deactivate_graph_mode()
 
         entry = _GraphEntry(
             graph=g,

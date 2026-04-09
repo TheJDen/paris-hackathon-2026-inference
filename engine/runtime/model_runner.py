@@ -102,6 +102,68 @@ class ModelRunner:
             self._sampler_generator = torch.Generator(device=device)
             self._sampler_generator.manual_seed(0)
 
+        # ------------------------------------------------------------------
+        # Pre-allocated per-step decode buffers (CPU-staging + GPU targets).
+        # Eager decode used to build five fresh tensors per step via
+        # torch.tensor([...]), each of which forces a Python-to-C++ hop and a
+        # pageable host→device memcpy. We pre-allocate once here (sized to
+        # num_slots == max decode batch) and copy_ per step. The CPU staging
+        # buffers live in pinned memory when CUDA is available so the H2D
+        # copy is asynchronous.
+        # ------------------------------------------------------------------
+        self._decode_buf_capacity = num_slots
+        _pin = device.type == "cuda"
+        # CPU staging (pinned) — filled by Python per step.
+        self._dec_cpu_input_ids = torch.zeros(
+            num_slots, 1, dtype=torch.long, pin_memory=_pin
+        )
+        self._dec_cpu_position_ids = torch.zeros(
+            num_slots, 1, dtype=torch.long, pin_memory=_pin
+        )
+        self._dec_cpu_slot_ids = torch.zeros(
+            num_slots, dtype=torch.int64, pin_memory=_pin
+        )
+        self._dec_cpu_kv_seq_lens = torch.zeros(
+            num_slots, dtype=torch.int64, pin_memory=_pin
+        )
+        self._dec_cpu_attn_mask = torch.zeros(
+            num_slots, max_seq_len, dtype=torch.long, pin_memory=_pin
+        )
+        self._dec_cpu_temps = torch.zeros(
+            num_slots, dtype=torch.float32, pin_memory=_pin
+        )
+        self._dec_cpu_top_ps = torch.ones(
+            num_slots, dtype=torch.float32, pin_memory=_pin
+        )
+        # GPU targets — sized to the max decode batch + max_seq_len.
+        self._dec_gpu_input_ids = torch.zeros(
+            num_slots, 1, dtype=torch.long, device=device
+        )
+        self._dec_gpu_position_ids = torch.zeros(
+            num_slots, 1, dtype=torch.long, device=device
+        )
+        self._dec_gpu_slot_ids = torch.zeros(
+            num_slots, dtype=torch.int64, device=device
+        )
+        self._dec_gpu_kv_seq_lens = torch.zeros(
+            num_slots, dtype=torch.int64, device=device
+        )
+        self._dec_gpu_attn_mask = torch.zeros(
+            num_slots, max_seq_len, dtype=torch.long, device=device
+        )
+        self._dec_gpu_temps = torch.zeros(
+            num_slots, dtype=torch.float32, device=device
+        )
+        self._dec_gpu_top_ps = torch.ones(
+            num_slots, dtype=torch.float32, device=device
+        )
+        # Pre-build write-positions tensor of shape [num_slots, 1] on GPU so
+        # decode can avoid building B fresh one-element tensors per step. We
+        # hand out per-row *views* (narrow(0, i, 1)) each step.
+        self._dec_gpu_write_positions = torch.zeros(
+            num_slots, 1, dtype=torch.int64, device=device
+        )
+
         # Warmup: fire the compile before the first real request.
         if self._compile_enabled:
             self._warmup_compile()
@@ -646,46 +708,81 @@ class ModelRunner:
             B = len(slot_ids)
             assert B == len(last_tokens) == len(cache_lengths)
 
-            # ---- Build per-step tensors (always eager, always outside graph) ----
-            input_ids = torch.tensor(
-                [[t] for t in last_tokens], dtype=torch.long, device=self.device
-            )  # [B, 1]
-            slot_ids_t = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
-            write_positions = [
-                torch.tensor([cache_lengths[i]], dtype=torch.int64, device=self.device)
-                for i in range(B)
-            ]
-            query_lens = torch.ones(B, dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor(
-                [cache_lengths[i] + 1 for i in range(B)],
-                dtype=torch.int64, device=self.device,
+            # ---- Build per-step tensors using pre-allocated buffers ----
+            # We stage into pinned-CPU buffers (single Python→C++ hop per
+            # tensor instead of one per row) and issue a batched async H2D
+            # copy. The previous implementation built five fresh tensors per
+            # step via torch.tensor([...]), each of which walked Python
+            # list→C++ and did its own pageable memcpy.
+            max_s = 0
+            cpu_input_ids = self._dec_cpu_input_ids
+            cpu_position_ids = self._dec_cpu_position_ids
+            cpu_slot_ids = self._dec_cpu_slot_ids
+            cpu_kv_seq_lens = self._dec_cpu_kv_seq_lens
+            cpu_attn_mask = self._dec_cpu_attn_mask
+            for b in range(B):
+                cl = cache_lengths[b]
+                cpu_input_ids[b, 0] = last_tokens[b]
+                cpu_position_ids[b, 0] = cl
+                cpu_slot_ids[b] = slot_ids[b]
+                full = cl + 1
+                cpu_kv_seq_lens[b] = full
+                if full > max_s:
+                    max_s = full
+            # Zero out the active portion of the attention mask in bulk,
+            # then fill [0, full_len) with 1s row by row. `fill_` on a slice
+            # is cheaper than constructing a fresh zeros tensor on GPU.
+            cpu_attn_mask[:B, :max_s].zero_()
+            for b in range(B):
+                cpu_attn_mask[b, : cache_lengths[b] + 1] = 1
+
+            # Single async H2D copy for each buffer (pinned → device).
+            non_blocking = self.device.type == "cuda"
+            self._dec_gpu_input_ids[:B].copy_(cpu_input_ids[:B], non_blocking=non_blocking)
+            self._dec_gpu_position_ids[:B].copy_(cpu_position_ids[:B], non_blocking=non_blocking)
+            self._dec_gpu_slot_ids[:B].copy_(cpu_slot_ids[:B], non_blocking=non_blocking)
+            self._dec_gpu_kv_seq_lens[:B].copy_(cpu_kv_seq_lens[:B], non_blocking=non_blocking)
+            self._dec_gpu_attn_mask[:B, :max_s].copy_(
+                cpu_attn_mask[:B, :max_s], non_blocking=non_blocking
+            )
+            # write_positions = position_ids view (they match in decode: the
+            # absolute slot position of the new token == cache_lengths[b]).
+            self._dec_gpu_write_positions[:B].copy_(
+                cpu_position_ids[:B], non_blocking=non_blocking
             )
 
-            # position_ids[b] = cache_lengths[b] (the absolute position of the new token)
-            position_ids = torch.tensor(
-                [[cache_lengths[i]] for i in range(B)],
-                dtype=torch.long, device=self.device,
-            )
-            # attention_mask: padded to max kv_seq_len, mask out empty positions.
-            # For the graph path, this is copied into the static buffer (which is
-            # sized to max_seq_len); for the eager path it's used directly.
-            max_s = int(kv_seq_lens.max().item())
-            attention_mask = torch.zeros(B, max_s, dtype=torch.long, device=self.device)
-            for b in range(B):
-                attention_mask[b, : cache_lengths[b] + 1] = 1
+            input_ids = self._dec_gpu_input_ids[:B]
+            position_ids = self._dec_gpu_position_ids[:B]
+            attention_mask = self._dec_gpu_attn_mask[:B, :max_s]
+            slot_ids_t = self._dec_gpu_slot_ids[:B]
+            kv_seq_lens = self._dec_gpu_kv_seq_lens[:B]
+            # Per-row write_positions list is not used on the decode fast
+            # path — the cache reads `write_positions_flat` instead. We pass
+            # an empty list to avoid building B 1-elem views per step.
+            write_positions: list[torch.Tensor] = []
+            # query_lens is always all-ones for decode; lazily reuse a cached
+            # ones tensor of the needed size.
+            if getattr(self, "_dec_gpu_query_lens_cache", None) is None or \
+                    self._dec_gpu_query_lens_cache.shape[0] < self._decode_buf_capacity:
+                self._dec_gpu_query_lens_cache = torch.ones(
+                    self._decode_buf_capacity, dtype=torch.int64, device=self.device
+                )
+            query_lens = self._dec_gpu_query_lens_cache[:B]
 
             # ---- Cache set_batch is ALWAYS outside the graph ----
             # gather_for_batch (index_select + clone) is not graph-safe because
             # it allocates new tensors with data-dependent indices each call.
-            self.cache.set_batch(
-                BatchSlots(
-                    slot_ids=slot_ids_t,
-                    write_positions=write_positions,
-                    query_lens=query_lens,
-                    kv_seq_lens=kv_seq_lens,
-                    is_prefill=False,
-                )
+            batch = BatchSlots(
+                slot_ids=slot_ids_t,
+                write_positions=write_positions,
+                query_lens=query_lens,
+                kv_seq_lens=kv_seq_lens,
+                is_prefill=False,
+                max_kv_seq_len=max_s,
+                # Flat write positions == position_ids view, 1 token per row.
+                write_positions_flat=self._dec_gpu_write_positions[:B].view(-1),
             )
+            self.cache.set_batch(batch)
 
             # ---- Model forward + lm_head ----
             if self.decode_graphs is not None:
@@ -718,20 +815,33 @@ class ModelRunner:
 
             # ---- Sampler — always eager, outside the graph ----
             with time_region("runner.decode.sample"):
+                # Greedy fast-path: skip building per-row temp/top_p tensors
+                # entirely when every row is greedy (which is the common
+                # benchmark case). Saves two host→device tensor constructions
+                # plus the _sample `.all()` reduction check.
+                all_greedy = True
                 if samplings is not None:
-                    temps = torch.tensor(
-                        [s.temperature for s in samplings],
-                        dtype=torch.float32, device=self.device,
-                    )
-                    top_ps = torch.tensor(
-                        [s.top_p for s in samplings],
-                        dtype=torch.float32, device=self.device,
-                    )
+                    for s in samplings:
+                        if s is not None and s.temperature > 0.0:
+                            all_greedy = False
+                            break
+                if all_greedy:
+                    next_tokens = torch.argmax(logits, dim=-1)
                 else:
-                    temps = torch.zeros(B, dtype=torch.float32, device=self.device)
-                    top_ps = torch.ones(B, dtype=torch.float32, device=self.device)
-                next_tokens = self._sample(logits, temps, top_ps)  # [B]
-            return [int(t.item()) for t in next_tokens]
+                    cpu_temps = self._dec_cpu_temps
+                    cpu_top_ps = self._dec_cpu_top_ps
+                    for b, s in enumerate(samplings):
+                        cpu_temps[b] = s.temperature if s is not None else 0.0
+                        cpu_top_ps[b] = s.top_p if s is not None else 1.0
+                    self._dec_gpu_temps[:B].copy_(cpu_temps[:B], non_blocking=non_blocking)
+                    self._dec_gpu_top_ps[:B].copy_(cpu_top_ps[:B], non_blocking=non_blocking)
+                    next_tokens = self._sample(
+                        logits, self._dec_gpu_temps[:B], self._dec_gpu_top_ps[:B]
+                    )  # [B]
+            # Single D2H via tolist() — one sync instead of B syncs from
+            # [int(t.item()) for t in next_tokens]. tolist() for a small
+            # int64 vector is fused into a single copy.
+            return next_tokens.tolist()
 
     # ------------------------------------------------------------------ #
     # sampling — greedy fast-path + temperature / top-p nucleus sampling

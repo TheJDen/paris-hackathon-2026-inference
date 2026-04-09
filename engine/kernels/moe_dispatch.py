@@ -150,9 +150,14 @@ def _helion_dispatch(
     _helion_histogram(flat, counts)
 
     # Exclusive prefix sum -> offsets[0..E], length E+1.
+    # NOTE: torch.cumsum cannot accept both `dtype=` and `out=` together (it
+    # raises "dtype argument and out dtype must match"). Do the cumsum first,
+    # then write into offsets32. cumsum on int32 upcasts to int64 on some
+    # torch versions, so cast back explicitly.
+    cs = torch.cumsum(counts, dim=0).to(torch.int32)
     offsets32 = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     offsets32[0] = 0
-    torch.cumsum(counts, dim=0, dtype=torch.int32, out=offsets32[1:])
+    offsets32[1:] = cs
 
     write_cursor = torch.zeros(num_experts, dtype=torch.int32, device=device)
     sorted_token_idx = torch.empty(N, dtype=torch.int32, device=device)

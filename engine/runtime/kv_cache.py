@@ -184,11 +184,90 @@ class _LinearAttentionSlotLayer(_SlotLayerBase):
         self.conv_states: torch.Tensor | None = None
         self.recurrent_states: torch.Tensor | None = None
 
+        # Graph-mode persistent buffers.  When the cache is in graph mode for
+        # a specific bucket, these hold PERSISTENT tensors that the captured
+        # CUDA graph references.  gather_for_batch writes INTO them (copy_)
+        # instead of allocating a fresh clone, so the graph's captured
+        # pointers remain valid across replays.  Keyed by bucket size.
+        self._graph_conv_bufs: dict[int, torch.Tensor] = {}
+        self._graph_rec_bufs: dict[int, torch.Tensor] = {}
+        # The currently active bucket (None → eager, clone-based path).
+        self._graph_active_bucket: int | None = None
+
+    # ------------------------- graph-mode buffers -----------------------
+
+    def ensure_graph_buffers(self, bucket: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate persistent conv/recurrent buffers for this bucket if missing.
+
+        Returns the (conv_buf, rec_buf) pair as stable persistent tensors
+        of shape ``[bucket, conv_dim, conv_kernel]`` and
+        ``[bucket, num_v_heads, head_k_dim, head_v_dim]`` respectively.
+        The captured CUDA graph will reference these exact tensors.
+        """
+        if bucket not in self._graph_conv_bufs:
+            self._graph_conv_bufs[bucket] = torch.zeros(
+                bucket,
+                *self._pool_conv_states.shape[1:],
+                dtype=self._pool_conv_states.dtype,
+                device=self.device,
+            )
+            self._graph_rec_bufs[bucket] = torch.zeros(
+                bucket,
+                *self._pool_recurrent_states.shape[1:],
+                dtype=self._pool_recurrent_states.dtype,
+                device=self.device,
+            )
+        return self._graph_conv_bufs[bucket], self._graph_rec_bufs[bucket]
+
+    def activate_graph_bucket(self, bucket: int) -> None:
+        """Switch this layer into graph mode for the given bucket.
+
+        After this call, ``self.conv_states`` / ``recurrent_states`` point at
+        the persistent buffers for ``bucket`` and will be reused by subsequent
+        ``gather_for_batch`` calls.
+        """
+        conv_buf, rec_buf = self.ensure_graph_buffers(bucket)
+        self.conv_states = conv_buf
+        self.recurrent_states = rec_buf
+        self._graph_active_bucket = bucket
+
+    def deactivate_graph_mode(self) -> None:
+        """Return to the eager clone-based path (does not free buffers)."""
+        self._graph_active_bucket = None
+        # Drop the active references so later eager gather_for_batch calls
+        # allocate fresh clones (which is what eager code expects).
+        self.conv_states = None
+        self.recurrent_states = None
+
     # ------------------------- gather / scatter -------------------------
 
     def gather_for_batch(self, slot_ids: torch.Tensor) -> None:
-        """Materialize the active view from the pool. Called before forward."""
-        # Clone so the model's in-place mutations don't fight other slots.
+        """Materialize the active view from the pool. Called before forward.
+
+        In graph mode, copies INTO the persistent buffers so pointers stay
+        stable across CUDA graph replays.  The number of real rows must be
+        <= ``bucket``; callers are expected to pad ``slot_ids`` up to the
+        bucket size themselves (the runner does this in the graph path).
+        """
+        if self._graph_active_bucket is not None:
+            bucket = self._graph_active_bucket
+            assert slot_ids.shape[0] == bucket, (
+                f"graph mode bucket={bucket} but got {slot_ids.shape[0]} slot_ids"
+            )
+            conv_buf = self._graph_conv_bufs[bucket]
+            rec_buf = self._graph_rec_bufs[bucket]
+            # Index-select into the persistent buffers.  Using out= would be
+            # ideal but index_select doesn't support out= with cuda indices in
+            # all torch versions; a copy_() of index_select's result is
+            # equivalent and keeps the destination pointer stable.
+            conv_buf.copy_(self._pool_conv_states.index_select(0, slot_ids))
+            rec_buf.copy_(self._pool_recurrent_states.index_select(0, slot_ids))
+            # Attributes already point at the persistent buffers (set by
+            # activate_graph_bucket); nothing else to do.
+            return
+
+        # Eager path: clone so the model's in-place mutations don't fight
+        # other slots.
         self.conv_states = self._pool_conv_states.index_select(0, slot_ids).clone()
         self.recurrent_states = self._pool_recurrent_states.index_select(0, slot_ids).clone()
 
@@ -492,6 +571,9 @@ class SlotPoolCache:
         layer = self.layers[layer_idx]
         assert isinstance(layer, _LinearAttentionSlotLayer)
         assert self.batch is not None
+        if layer._graph_active_bucket is not None and layer.conv_states is not None:
+            layer.conv_states.copy_(new_conv_state.to(layer.conv_states.dtype))
+            return layer.conv_states
         layer.conv_states = new_conv_state
         return new_conv_state
 
@@ -502,10 +584,24 @@ class SlotPoolCache:
         **_kwargs,
     ) -> torch.Tensor:
         """Set the active view for this layer's recurrent state.
-        Scatter to the pool happens in commit_batch."""
+        Scatter to the pool happens in commit_batch.
+
+        In graph mode the active recurrent buffer is a PERSISTENT tensor
+        that the captured CUDA graph holds a direct pointer to.  We must
+        not rebind the attribute (that would leave the graph referencing
+        an orphan tensor); instead we copy the new state IN PLACE into
+        the persistent buffer so that the copy is itself captured and
+        subsequent replays land the updated state in the same memory.
+        """
         layer = self.layers[layer_idx]
         assert isinstance(layer, _LinearAttentionSlotLayer)
         assert self.batch is not None
+        if layer._graph_active_bucket is not None and layer.recurrent_states is not None:
+            # In-place update into the persistent buffer.  Safe under CUDA
+            # graph capture: the copy_ becomes part of the captured kernel
+            # stream.
+            layer.recurrent_states.copy_(new_recurrent_state.to(layer.recurrent_states.dtype))
+            return layer.recurrent_states
         layer.recurrent_states = new_recurrent_state
         return new_recurrent_state
 

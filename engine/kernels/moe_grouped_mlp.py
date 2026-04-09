@@ -9,12 +9,25 @@ boolean-mask gathers per expert).
 
 HF weight layout (``Qwen3_5MoeExperts``):
 
-    gate_up_proj : [E, 2*I, H]   — used with ``F.linear(x, W)`` → x @ W.T
-    down_proj    : [E, H,   I]   — same convention
+    gate_up_proj : Parameter [E, 2*I, H]   used with F.linear(x, W) = x @ W.T
+    down_proj    : Parameter [E, H,   I]   same convention
 
-``torch._grouped_mm`` wants ``b`` shaped ``[E, K, N]`` so we transpose once
-at patch time and cache the transposed parameters as ``_fused_b_gate_up``
-and ``_fused_b_down`` on the ``Qwen3_5MoeExperts`` module.
+``torch._grouped_mm`` wants B shaped ``[E, K, N]`` so we transpose once at
+first-call time and cache the transposed tensors as ``_fused_b_gate_up`` and
+``_fused_b_down`` on the ``Qwen3_5MoeExperts`` module.
+
+Return contract
+---------------
+The HF ``Qwen3_5MoeSparseMoeBlock.forward`` returns a single Tensor with
+shape ``[batch, seq, hidden]`` (see transformers >= 5.5). We match that
+exactly. The HF decoder layer does ``if isinstance(x, tuple): x, _ = x``
+so returning a plain tensor is correct.
+
+Escape hatch
+------------
+If anything inside the fused path raises, ``patch._patched_forward`` catches
+it and falls back to the original HF forward, so a kernel bug can never
+crash the engine.
 """
 
 from __future__ import annotations
@@ -33,23 +46,29 @@ _HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
 
 
 def _ensure_fused_weights(experts_module: torch.nn.Module) -> None:
-    """Cache the transposed expert weights for torch._grouped_mm.
-
-    Runs once per module (idempotent). We copy rather than view so that the
-    contiguous layout matches what ``_grouped_mm`` expects. This doubles the
-    GPU memory for expert weights briefly, but they're bf16 and we drop the
-    originals if the caller opts in. For safety we keep both so model state
-    dict loading still works.
-    """
+    """Cache transposed expert weights for torch._grouped_mm. Idempotent."""
     if getattr(experts_module, "_fused_ready", False):
         return
     with torch.no_grad():
-        gate_up = experts_module.gate_up_proj  # [E, 2*I, H]
-        down = experts_module.down_proj  # [E, H, I]
-        # Transpose last two dims -> [E, H, 2*I] and [E, I, H]
-        experts_module._fused_b_gate_up = gate_up.transpose(-1, -2).contiguous()
-        experts_module._fused_b_down = down.transpose(-1, -2).contiguous()
+        gate_up = experts_module.gate_up_proj  # Parameter [E, 2*I, H]
+        down = experts_module.down_proj  # Parameter [E, H, I]
+        # Transpose last two dims -> [E, H, 2*I] and [E, I, H].
+        # .contiguous() to match grouped_mm's stride expectations.
+        b_gate_up = gate_up.detach().transpose(-1, -2).contiguous()
+        b_down = down.detach().transpose(-1, -2).contiguous()
+    # Stash as plain attributes (not Parameters / buffers) so state_dict
+    # loading / saving is untouched. They're already on the right device
+    # because gate_up_proj is.
+    experts_module._fused_b_gate_up = b_gate_up
+    experts_module._fused_b_down = b_down
     experts_module._fused_ready = True
+    log.info(
+        "cached fused MoE weights: b_gate_up=%s b_down=%s dtype=%s device=%s",
+        tuple(b_gate_up.shape),
+        tuple(b_down.shape),
+        b_gate_up.dtype,
+        b_gate_up.device,
+    )
 
 
 def _grouped_swiglu(
@@ -59,31 +78,27 @@ def _grouped_swiglu(
     offsets_i64: torch.Tensor,  # [E+1] int64
     act_fn,
 ) -> torch.Tensor:
-    """Run SwiGLU for every expert group in one grouped matmul each.
+    """Run SwiGLU for every expert group. Tries grouped_mm, falls back to narrow loop."""
+    # torch._grouped_mm wants offsets of shape [E] representing the
+    # exclusive prefix sum ends (i.e. offsets_i64[1:]) in int32.
+    offs_i32 = offsets_i64[1:].to(torch.int32).contiguous()
 
-    ``_grouped_mm`` with ``offs`` wants offsets of shape [E] representing the
-    exclusive prefix sum ends (i.e. offsets_i64[1:]).
-    """
-    # torch._grouped_mm expects int32 offsets (verified empirically against
-    # torch 2.11). Use the exclusive prefix-sum ends (offsets_i64[1:]).
-    offs = offsets_i64[1:].to(torch.int32).contiguous()
     if _HAS_GROUPED_MM:
         try:
-            gate_up = torch._grouped_mm(x_permuted, b_gate_up, offs=offs)  # [N, 2I]
+            gate_up = torch._grouped_mm(x_permuted, b_gate_up, offs=offs_i32)  # [N, 2I]
             gate, up = gate_up.chunk(2, dim=-1)
             inter = act_fn(gate) * up  # [N, I]
-            out = torch._grouped_mm(inter, b_down, offs=offs)  # [N, H]
+            out = torch._grouped_mm(inter, b_down, offs=offs_i32)  # [N, H]
             return out
-        except Exception as e:  # pragma: no cover
+        except Exception as e:  # pragma: no cover - torch version / alignment
             log.warning("torch._grouped_mm failed (%s); falling back to narrow loop", e)
 
-    # Fallback: narrow()-based loop. Still fast because the input is already
-    # permuted into contiguous per-expert runs — no boolean mask gather.
+    # Narrow-based fallback. Still fast because the input is already permuted
+    # into contiguous per-expert runs — no boolean mask gather.
     E = b_gate_up.shape[0]
-    H = x_permuted.shape[-1]
     out = torch.empty_like(x_permuted)
-    # offsets_i64 is [E+1]; we can read it on CPU once (small, 257 entries).
-    offs_cpu = offsets_i64.detach().to("cpu", non_blocking=False).tolist()
+    # offsets_i64 is [E+1]; read on CPU once (small: 257 entries for Qwen3.5).
+    offs_cpu = offsets_i64.detach().to("cpu").tolist()
     for e in range(E):
         lo, hi = offs_cpu[e], offs_cpu[e + 1]
         n_e = hi - lo
@@ -105,21 +120,26 @@ def fused_experts_forward(
 ) -> torch.Tensor:
     """Replacement for ``Qwen3_5MoeExperts.forward``.
 
-    Same signature and return shape. The math is identical — we just avoid
-    the per-expert Python loop with its 2*E boolean-mask gathers.
+    Same semantics, same output shape. Avoids the per-expert Python loop
+    with its 2*E boolean-mask gathers.
     """
     _ensure_fused_weights(experts_module)
-    num_experts = experts_module.num_experts
+    num_experts = int(experts_module.num_experts)
     T, H = hidden_states.shape
-    K = top_k_index.shape[-1]
 
     sorted_tok, sorted_slot, offsets = moe_dispatch_indices(top_k_index, num_experts)
 
-    # Gather the tokens into per-expert contiguous runs. This is ONE
-    # gather on [T*K] entries, replacing E=256 per-expert gathers in HF.
-    # sorted_tok is int32; index_select needs int64 on some torch versions.
+    # Advanced indexing wants int64 on current torch.
     sorted_tok_i64 = sorted_tok.to(torch.int64)
+    sorted_slot_i64 = sorted_slot.to(torch.int64)
+
+    # Gather tokens into per-expert contiguous runs. One gather on [T*K]
+    # entries, replacing E=256 per-expert gathers in HF.
     x_permuted = hidden_states.index_select(0, sorted_tok_i64)  # [T*K, H]
+
+    # Make sure the grouped matmul sees the exact same dtype as the weights.
+    if x_permuted.dtype != experts_module._fused_b_gate_up.dtype:
+        x_permuted = x_permuted.to(experts_module._fused_b_gate_up.dtype)
 
     y_permuted = _grouped_swiglu(
         x_permuted,
@@ -129,14 +149,16 @@ def fused_experts_forward(
         experts_module.act_fn,
     )
 
-    # Scale by routing weights. top_k_weights is [T, K]; we need it gathered
-    # in the same order as sorted_tok/sorted_slot.
-    sorted_slot_i64 = sorted_slot.to(torch.int64)
-    w = top_k_weights[sorted_tok_i64, sorted_slot_i64].to(y_permuted.dtype)  # [T*K]
+    # Scale by routing weights. top_k_weights is [T, K]; gather in permuted
+    # order via the two index vectors.
+    w = top_k_weights[sorted_tok_i64, sorted_slot_i64].to(y_permuted.dtype)
     y_permuted = y_permuted * w.unsqueeze(-1)
 
     # Scatter-add back to the dense output.
     final = torch.zeros_like(hidden_states)
+    # index_add_ needs source dtype == destination dtype.
+    if y_permuted.dtype != final.dtype:
+        y_permuted = y_permuted.to(final.dtype)
     final.index_add_(0, sorted_tok_i64, y_permuted)
     return final
 
@@ -145,7 +167,8 @@ def fused_moe_forward(moe_block: torch.nn.Module, hidden_states: torch.Tensor):
     """Replacement for ``Qwen3_5MoeSparseMoeBlock.forward``.
 
     Mirrors the HF implementation but routes the experts call through the
-    fused dispatch path.
+    fused dispatch path. Returns a single Tensor of the same shape as the
+    input, matching HF's current return contract.
     """
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hs = hidden_states.view(-1, hidden_dim)
