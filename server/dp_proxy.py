@@ -206,10 +206,16 @@ class DPProxy:
                         return stream_resp
                     else:
                         resp_body = await resp.read()
+                        # Drop Content-Type from forwarded headers — aiohttp
+                        # forbids passing both `headers` and `content_type`.
+                        clean_headers = {
+                            k: v for k, v in resp_headers.items()
+                            if k.lower() != "content-type"
+                        }
                         return web.Response(
                             status=resp.status,
                             body=resp_body,
-                            headers=resp_headers,
+                            headers=clean_headers,
                             content_type=resp.content_type or "application/json",
                         )
             except (ClientError, asyncio.TimeoutError, OSError) as exc:
