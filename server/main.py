@@ -1,0 +1,106 @@
+"""Server entrypoint.
+
+Usage:
+    python -m server.main --model Qwen/Qwen3.5-35B-A3B --port 8000 [--stub]
+
+In Phase 0 you will almost always want `--stub` so the server boots without
+a GPU and you can verify the OpenAI shape against `eval/check_server.py`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+
+import uvicorn
+
+from engine.runtime.engine import Engine
+from engine.runtime.metrics import metrics
+from engine.runtime.profiling import enable_torch_profiler
+from server.app import create_app
+
+
+log = logging.getLogger("server.main")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="paris-hackathon-2026-inference server")
+    p.add_argument("--model", default="Qwen/Qwen3.5-35B-A3B")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--tp", type=int, default=1, help="tensor parallel size")
+    p.add_argument("--max-batch", type=int, default=64)
+    p.add_argument("--max-model-len", type=int, default=4096)
+    p.add_argument(
+        "--batch-window-ms",
+        type=float,
+        default=5.0,
+        help="time the batcher waits to gather more requests before launching",
+    )
+    p.add_argument("--device", default="cuda:0", help="device for the (Phase 1) single-GPU engine")
+    p.add_argument(
+        "--attn-impl",
+        default="sdpa",
+        choices=["sdpa", "eager", "flash_attention_2"],
+        help="HF attention implementation flag",
+    )
+    p.add_argument(
+        "--stub",
+        action="store_true",
+        help="run without loading a model — returns canned text (Phase 0 smoke test)",
+    )
+    p.add_argument(
+        "--metrics-interval",
+        type=float,
+        default=5.0,
+        help="seconds between live metrics flushes to stdout (0 = off)",
+    )
+    p.add_argument(
+        "--profile-torch",
+        action="store_true",
+        help="arm torch.profiler for a bounded window (deep-dive only)",
+    )
+    p.add_argument(
+        "--profile-window",
+        default=None,
+        help="step window for torch.profiler, e.g. 10:20",
+    )
+    p.add_argument("--profile-tag", default="run", help="tag for profile artifact names")
+    return p.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    args = parse_args()
+
+    if args.profile_torch:
+        window = None
+        if args.profile_window:
+            start, stop = args.profile_window.split(":")
+            window = (int(start), int(stop))
+        enable_torch_profiler(window, tag=args.profile_tag)
+
+    log.info(
+        "building engine model=%s stub=%s tp=%d max_batch=%d max_model_len=%d",
+        args.model, args.stub, args.tp, args.max_batch, args.max_model_len,
+    )
+    engine = Engine.build(
+        args.model,
+        stub=args.stub,
+        tp=args.tp,
+        max_batch=args.max_batch,
+        max_model_len=args.max_model_len,
+        device=args.device,
+        attn_impl=args.attn_impl,
+        batch_window_ms=args.batch_window_ms,
+    )
+
+    if args.metrics_interval > 0:
+        metrics.start_flusher(interval_s=args.metrics_interval)
+
+    app = create_app(engine)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

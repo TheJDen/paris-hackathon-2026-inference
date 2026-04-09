@@ -15,9 +15,22 @@ dependencies = [
 
 [project.optional-dependencies]
 baseline = ["vllm>=0.8"]
+engine = [
+    "torch>=2.5",
+    "transformers>=4.47",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.25",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "tokenizers>=0.20",
+    "einops>=0.8",
+    "nvidia-ml-py>=12.560",
+    "pytest>=8",
+]
 
 [tool.setuptools.packages.find]
-include = ["eval*"]
+include = ["eval*", "engine*", "server*"]
 
 [project.scripts]
 check-server = "eval.check_server:main"

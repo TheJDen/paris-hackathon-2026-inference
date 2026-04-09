@@ -20,3 +20,11 @@ baseline/results/correctness_raw/
 
 # Prompts (generated but committed)
 # eval/throughput/prompts.json
+
+# Profiling artifacts (keep README.md, drop everything else)
+profiles/*
+!profiles/README.md
+
+# Server runtime artifacts
+server.log
+results/
