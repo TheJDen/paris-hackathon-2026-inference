@@ -33,6 +33,22 @@ PYTHON="${PYTHON:-python}"
 PID_FILE="/tmp/server-${PORT}.pid"
 
 # ---------------------------------------------------------------------------
+# TP > 1: re-exec under torchrun so every TP rank gets its own python process
+# with WORLD_SIZE / RANK / LOCAL_RANK env vars. Rank 0 binds the HTTP port;
+# rank >0 enters tp_worker_loop. We parse a leading --tp N out of the user's
+# args and use it as nproc_per_node.
+# ---------------------------------------------------------------------------
+TP_VAL=1
+_prev=""
+for _arg in "$@"; do
+    if [ "$_prev" = "--tp" ]; then
+        TP_VAL="$_arg"
+    fi
+    _prev="$_arg"
+done
+TP_MASTER_PORT="${TP_MASTER_PORT:-29500}"
+
+# ---------------------------------------------------------------------------
 # Bug 3: Fail loud if the port is already in use.
 # ---------------------------------------------------------------------------
 if lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
@@ -44,7 +60,14 @@ fi
 # ---------------------------------------------------------------------------
 # Bug 4: Print the full command line before launching.
 # ---------------------------------------------------------------------------
-CMD=("$PYTHON" -m server.main --model "$MODEL" --port "$PORT" "$@")
+if [ "$TP_VAL" -gt 1 ]; then
+    CMD=("$PYTHON" -m torch.distributed.run \
+         --nproc_per_node="$TP_VAL" \
+         --master_port="$TP_MASTER_PORT" \
+         -m server.main --model "$MODEL" --port "$PORT" "$@")
+else
+    CMD=("$PYTHON" -m server.main --model "$MODEL" --port "$PORT" "$@")
+fi
 echo "[start.sh] launching: ${CMD[*]}"
 echo "[start.sh] model=${MODEL} port=${PORT} log=${LOG_FILE}"
 

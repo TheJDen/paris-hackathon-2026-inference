@@ -112,15 +112,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     args = parse_args()
 
-    # Expert-parallel aware: under torchrun, WORLD_SIZE / RANK / LOCAL_RANK
+    # TP / EP aware: under torchrun, WORLD_SIZE / RANK / LOCAL_RANK
     # are set by the launcher. Only rank 0 binds HTTP. Non-zero ranks load
     # the same engine and enter a passive worker loop so they participate
-    # in the MoE all_reduce collectives driven by rank 0's forwards.
+    # in the MoE / RowParallelLinear all_reduce collectives driven by rank 0.
     import os as _os_main
     _ep_world = int(_os_main.environ.get("WORLD_SIZE", "1"))
     _ep_rank = int(_os_main.environ.get("RANK", "0"))
     _ep_local_rank = int(_os_main.environ.get("LOCAL_RANK", "0"))
-    if args.ep > 1 and _ep_world > 1:
+    if (args.ep > 1 or args.tp > 1) and _ep_world > 1:
         args.device = f"cuda:{_ep_local_rank}"
 
     if args.profile_torch or args.profile_torch_after_batches > 0:
@@ -147,23 +147,25 @@ def main() -> None:
         torch_compile=args.torch_compile,
     )
 
-    if args.metrics_interval > 0:
+    if args.metrics_interval > 0 and _ep_rank == 0:
         metrics.start_flusher(interval_s=args.metrics_interval)
 
-    # EP: only rank 0 serves HTTP. Non-zero ranks enter a passive worker
-    # loop that blocks on collectives driven by rank 0's forwards. The
-    # worker loop is necessarily simple — it waits for rank 0 to broadcast
-    # a wake/stop signal; in between it sits on torch.distributed.barrier.
-    #
-    # IMPORTANT: the current EP patch does NOT broadcast inputs from rank 0
-    # to worker ranks, so worker ranks cannot actually run the model forward
-    # in lockstep. A full implementation needs rank 0 to broadcast each
-    # forward's inputs (hidden_states at the MoE block boundary) or drive
-    # the same batch on every rank via an input-tensor broadcast at the top
-    # of the scheduler step. Until that lands, the worker loop below is a
-    # BLOCKING PLACEHOLDER: rank 0 will hang on the first MoE all_reduce
-    # because workers aren't participating.
-    if args.ep > 1 and _ep_rank != 0:
+    # TP > 1: workers re-exec'd by torchrun enter a lockstep loop that
+    # receives broadcast forward inputs from rank 0 and runs the local
+    # (sharded) inner_model.forward so collectives match up.
+    if args.tp > 1 and _ep_world > 1 and _ep_rank != 0:
+        from engine.runtime.tp_worker import tp_worker_loop
+        log.info("TP worker rank=%d local_rank=%d: entering lockstep loop",
+                 _ep_rank, _ep_local_rank)
+        try:
+            tp_worker_loop(engine, _ep_world, _ep_rank)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Legacy EP-only worker (TP==1, EP>1): no input broadcast yet — left
+    # as the passive barrier placeholder.
+    if args.ep > 1 and args.tp == 1 and _ep_rank != 0:
         log.info("EP worker rank=%d: model loaded, entering passive barrier loop", _ep_rank)
         try:
             import torch.distributed as _dist
@@ -172,6 +174,18 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         return
+
+    # Rank 0 path: monkey-patch inner_model.forward so every forward broadcasts
+    # its inputs to TP workers before running locally.
+    if args.tp > 1 and _ep_world > 1 and _ep_rank == 0:
+        from engine.runtime.tp_worker import make_rank0_forward, broadcast_shutdown
+        import atexit as _atexit
+        runner = engine.runner
+        inner = runner.inner_model
+        orig_fwd = inner.forward
+        inner.forward = make_rank0_forward(orig_fwd, _ep_world)
+        log.info("TP rank0: patched inner_model.forward for lockstep broadcast (world=%d)", _ep_world)
+        _atexit.register(broadcast_shutdown, _ep_world)
 
     app = create_app(engine)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
