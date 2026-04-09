@@ -1,6 +1,29 @@
-# Parallelism strategy for Qwen3.5-35B-A3B on 8×H200
+# Parallelism + scheduling strategy for Qwen3.5-35B-A3B on 8×H200
 
-The decision is **TP=8 first, then evaluate hybrid TP+EP** under load.
+Two separable axes:
+
+1. **Scheduling** — how we form batches over time (static microbatching
+   vs continuous in-flight batching). Currently static; this is the
+   biggest lever we have not pulled.
+2. **Parallelism** — how we split the model across GPUs (TP, EP, PP, or
+   hybrids). Currently TP=1; the second biggest lever.
+
+We do them in **that order**, and bundle each with whatever it requires
+to be useful.
+
+## Lever ordering (the big picture)
+
+| Phase | Milestone | Why this order |
+|---|---|---|
+| **2a** | **Continuous batching + paged KV** (one milestone) | Phase 1's static batcher wastes capacity: late requests can't join an in-flight batch, so even at c=64 we observe `avg_batch_size ≈ 15` and **c=64 throughput < c=32**. Continuous batching fixes both (sequences can join/leave the batch at any decode step). Paged KV is the enabler — variable-length sequences in a single running batch can't share contiguous KV allocations. They ship together. |
+| **2b** | **TP=8** (Megatron-style, replicated experts) | Multiplies compute and memory bandwidth by ~7×. Has to come **after** 2a, because TP doesn't help if you can't fill the existing GPU first. Also gives the routed experts more aggregate capacity. |
+| **3** | **Custom Helion kernels** (MoE grouped GEMM, DeltaNet recurrence) | Squeezes the per-step time once the engine is saturating compute. Diff-tested against the torch reference. |
+| **4** | **EP / hybrid TP+EP A/B** | Only meaningful once Phase 2a+2b is stable and the routing histogram is populated. Gated on three measurable signals (see below). |
+| **5** | **Tuning** — Helion autotuning, scheduler windows, CUDA graphs | Last 20-40%, after the structure is settled. |
+
+PP (pipeline parallelism) is **rejected** for this workload — see below.
+
+The decision below for parallelism is **TP=8 first, then evaluate hybrid TP+EP**.
 This document is the receipt — what we considered, why, and which
 microbenchmarks settle the open questions.
 
@@ -106,8 +129,11 @@ continuous batcher reliably sustains B≥32 even at low concurrency
 
 ## TL;DR
 
-> **Phase 2: TP=8 with replicated experts.** Land continuous batching +
-> paged KV in the same milestone. Once the engine is stable, populate
-> the routing histogram and the comms microbench, then prototype EP
-> behind a flag and A/B at c=16/32/64. Promote to default only if it
-> wins ≥10% on the weighted score *and* doesn't regress c=1..8.
+> 1. **Phase 2a: continuous batching + paged KV** — biggest single lever,
+>    fixes the c=64 < c=32 cliff, fills the batches we already have.
+> 2. **Phase 2b: TP=8 with replicated experts** — multiplies the now-saturated
+>    GPU compute by ~7×. Megatron-style hand-rolled wrappers, no fancy
+>    parallelism libraries fighting our MoE/DeltaNet ops.
+> 3. **Phase 4: EP / hybrid TP+EP A/B** — only after the routing histogram
+>    is populated and we have NCCL all-to-all microbench numbers. Gate
+>    promotion on ≥10% weighted score win without regressing c=1..8.

@@ -197,10 +197,42 @@ def torch_profiler_tag() -> str:
     return _torch_profile_tag
 
 
+def _git_short_sha() -> str:
+    """Best-effort git SHA without depending on subprocess.run on hot paths."""
+    try:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        head_path = os.path.join(repo_root, ".git", "HEAD")
+        if not os.path.exists(head_path):
+            return "nogit"
+        with open(head_path) as f:
+            head = f.read().strip()
+        if head.startswith("ref: "):
+            ref_path = os.path.join(repo_root, ".git", head[5:])
+            if os.path.exists(ref_path):
+                with open(ref_path) as f:
+                    return f.read().strip()[:7]
+            return "nogit"
+        return head[:7]
+    except Exception:
+        return "nogit"
+
+
 def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tuple[str, str, list[dict]]:
     """Dump a finished torch.profiler.profile to disk.
 
-    Returns (chrome_trace_path, summary_path, top_kernels).
+    Filename convention is **self-describing** so teammates can compare
+    profiles in Perfetto without opening each one to figure out what
+    it is:
+
+        torch_<tag>_b<batch_size>_n<captured_new_tokens>_<sha>_<ts>.{json.gz,txt,summary.json}
+
+    Example: `torch_phase1_microbatch_b16_n32_8e3ea09_20260409-123238.json.gz`
+
+    Reads `extra_meta["batch_size"]` and `extra_meta["captured_max_new_tokens"]`
+    if present; falls back to `?` markers if not. Writes the same meta as
+    a header into the .txt summary so the file is self-describing too.
+
+    Returns `(chrome_trace_path, summary_path, top_kernels)`.
 
     `top_kernels` is a list of `{name, self_cuda_us, self_cpu_us, count}`
     dicts for the top 30 ops by self CUDA time, suitable for embedding
@@ -211,9 +243,15 @@ def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tupl
 
     os.makedirs(_PROFILE_DIR, exist_ok=True)
     ts = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    chrome_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.json.gz")
-    summary_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.txt")
-    json_path = os.path.join(_PROFILE_DIR, f"torch_{tag}_{ts}.summary.json")
+    sha = _git_short_sha()
+    meta = extra_meta or {}
+    bs = meta.get("batch_size", "?")
+    nn = meta.get("captured_max_new_tokens", meta.get("max_new_tokens", "?"))
+
+    stem = f"torch_{tag}_b{bs}_n{nn}_{sha}_{ts}"
+    chrome_path = os.path.join(_PROFILE_DIR, f"{stem}.json.gz")
+    summary_path = os.path.join(_PROFILE_DIR, f"{stem}.txt")
+    json_path = os.path.join(_PROFILE_DIR, f"{stem}.summary.json")
 
     # Chrome trace
     try:
@@ -228,10 +266,16 @@ def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tupl
         row_limit=30,
     )
     with open(summary_path, "w") as f:
+        f.write(f"# torch.profiler summary\n")
+        f.write(f"# tag: {tag}\n")
+        f.write(f"# git_sha: {sha}\n")
+        f.write(f"# captured_at_utc: {ts}\n")
         if extra_meta:
             for k, v in extra_meta.items():
                 f.write(f"# {k}: {v}\n")
-            f.write("\n")
+        f.write(f"# chrome_trace: {os.path.basename(chrome_path)}\n")
+        f.write("#\n")
+        f.write("# sort: self_cuda_time_total\n\n")
         f.write(table)
 
     # Structured top-N for STATUS.md
@@ -252,7 +296,14 @@ def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tupl
     top_kernels.sort(key=lambda d: d["self_cuda_us"], reverse=True)
     top_kernels = top_kernels[:30]
 
+    full_meta = {
+        "tag": tag,
+        "git_sha": sha,
+        "captured_at_utc": ts,
+        "chrome_trace": os.path.basename(chrome_path),
+        **(extra_meta or {}),
+    }
     with open(json_path, "w") as f:
-        json.dump({"top_kernels": top_kernels, "meta": extra_meta or {}}, f, indent=2)
+        json.dump({"meta": full_meta, "top_kernels": top_kernels}, f, indent=2)
 
     return chrome_path, summary_path, top_kernels

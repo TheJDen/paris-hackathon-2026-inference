@@ -28,6 +28,7 @@ server depends on; later phases swap out the internals without touching it.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -114,8 +115,19 @@ class Engine:
         self._req_queue: asyncio.Queue[_BatchRequest] | None = None
         self._batcher_task: asyncio.Task | None = None
 
+        # Pin all model.generate calls to a single dedicated thread.
+        # asyncio.to_thread uses a multi-worker pool which trips
+        # torch.profiler's CUPTI thread-affinity check
+        # ("External init callback must run in same thread as
+        # registerClient"). One executor + one worker = same thread for
+        # every batch.
+        self._gen_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
         if not stub:
             self.tokenizer = ChatTokenizer(model_name)
+            self._gen_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="engine-gen"
+            )
 
         metrics.set_max_batch_capacity(self.max_batch)
 
@@ -164,6 +176,9 @@ class Engine:
             except (asyncio.CancelledError, Exception):
                 pass
             self._batcher_task = None
+        if self._gen_executor is not None:
+            self._gen_executor.shutdown(wait=False)
+            self._gen_executor = None
 
     async def generate(
         self,
@@ -293,7 +308,9 @@ class Engine:
             )
 
             t0 = time.perf_counter()
-            output_ids = await asyncio.to_thread(
+            assert self._gen_executor is not None
+            output_ids = await asyncio.get_running_loop().run_in_executor(
+                self._gen_executor,
                 self._generate_blocking,
                 input_ids,
                 attention_mask,
@@ -384,36 +401,55 @@ class Engine:
                     **gen_kwargs,
                 )
 
+    # Number of tokens of generation to actually capture under torch.profiler.
+    # Full 1024-token batches produce ~hundred-MB chrome traces that take
+    # minutes to serialize and freeze the engine. 32 tokens covers prefill
+    # + a representative tail of decode steps — enough to see kernel
+    # launches, attention, MoE expert dispatch, and H2D syncs, without the
+    # export hit.
+    PROFILE_CAPTURE_NEW_TOKENS: int = 32
+
     def _generate_with_torch_profile(
         self, input_ids, attention_mask, gen_kwargs, loaded
     ):
-        """One-shot torch.profiler capture of a single steady-state batch.
+        """One-shot torch.profiler capture of a *bounded* generation slice.
 
-        Wraps the entire `model.generate` call (which itself runs many
-        forward steps) so the trace covers the full prefill + decode of
-        one batch. After capturing, exports artifacts and flips
-        `_profile_done` so subsequent batches go through the fast path.
+        Profiles a short prefill + decode window so the chrome trace is
+        small enough to export in under a second. After capturing, runs
+        the *full* model.generate call so the calling request still gets
+        its real `max_new_tokens` worth of output. Flips `_profile_done`
+        so subsequent batches skip this path entirely.
         """
         import torch
         from torch.profiler import ProfilerActivity, profile as torch_profile_ctx
 
-        log.info("torch.profiler: capturing batch %d", self._batch_index)
+        full_max_new = int(gen_kwargs.get("max_new_tokens", 0))
+        capture_max_new = min(full_max_new, self.PROFILE_CAPTURE_NEW_TOKENS) or 8
+
+        log.info(
+            "torch.profiler: capturing batch %d (max_new_tokens=%d for capture, "
+            "request asked %d)",
+            self._batch_index, capture_max_new, full_max_new,
+        )
 
         torch.cuda.synchronize()
+
+        capture_kwargs = dict(gen_kwargs)
+        capture_kwargs["max_new_tokens"] = capture_max_new
 
         with torch_profile_ctx(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
-            with_stack=True,
-            with_modules=True,
+            with_stack=False,        # huge cost, not needed for hotspot view
+            with_modules=False,
             profile_memory=False,
         ) as prof:
             with time_region("engine.model.generate.profiled"):
                 with torch.inference_mode():
-                    output = loaded.model.generate(
+                    _ = loaded.model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        **gen_kwargs,
+                        **capture_kwargs,
                     )
             torch.cuda.synchronize()
 
@@ -423,7 +459,8 @@ class Engine:
             "batch_index": self._batch_index,
             "batch_size": int(input_ids.shape[0]),
             "input_padded_len": int(input_ids.shape[1]),
-            "max_new_tokens": int(gen_kwargs.get("max_new_tokens", 0)),
+            "captured_max_new_tokens": capture_max_new,
+            "request_max_new_tokens": full_max_new,
             "do_sample": bool(gen_kwargs.get("do_sample", False)),
             "model_name": self.model_name,
             "device": self.device,
@@ -442,7 +479,16 @@ class Engine:
         finally:
             self._profile_done = True
 
-        return output
+        # Now actually serve the request (without profiling) so the caller
+        # gets the full max_new_tokens of output. The profile capture above
+        # warmed the cache for this exact batch, so this is fast.
+        with time_region("engine.model.generate.after_profile"):
+            with torch.inference_mode():
+                return loaded.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **gen_kwargs,
+                )
 
     # ------------------------------------------------------------------ #
     # stub
