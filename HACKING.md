@@ -36,16 +36,18 @@ the server, how to iterate, and what's done vs what's next.
 Phase 0 conformance + Phase 1 correctness are both green:
 
 - `eval/check_server.py` → both checks PASS against the real engine.
-- Mini GSM8K (limit=20, num_concurrent=8) → 85% flexible-extract / 85% strict.
-- Full GSM8K gate (200 problems): currently running, results land in
-  `results/correctness_phase1_tp1_batched.json`.
+- **Full GSM8K gate (200 problems, num_concurrent=32, microbatch=32):
+  92.0% flexible-extract / 91.0% strict-match.** Gate is 87.5%; vLLM's
+  reported baseline is 91.5% / 91.0%, so we're tied. Wall time 3:01.
+- Mini GSM8K (limit=20, num_concurrent=32) → 85% on a randomly seeded
+  20-problem subset (small-sample noise — full 200 is the source of truth).
 
 ## Status: where we are in the plan
 
 | Phase | Goal | Status |
 |---|---|---|
 | 0 | Server skeleton + chat template + stub engine, laptop-side | ✅ done |
-| 1 | HF reference on a single H200, pass GSM8K ≥ 87.5% | ✅ correctness path lands; gate run in progress; static microbatching added so the eval is fast enough to iterate on |
+| 1 | HF reference on a single H200, pass GSM8K ≥ 87.5% | ✅ done — 92.0% flex / 91.0% strict, full 200-problem run, wall 3:01 |
 | 2 | Continuous batching, paged KV, DeltaNet state cache, **TP=8**, real perf | next |
 | 3 | Custom Helion kernels for MoE grouped GEMM + DeltaNet recurrence | after |
 | 4 | TP vs hybrid TP+EP for MoE, decided on profile data | after |
@@ -302,6 +304,23 @@ DeltaNet per-sequence state cache + TP=8.
 | asyncio.Lock + concurrent=2 (no batching) | 168 s |
 | Microbatch=16 + concurrent=8 | 74 s |
 | Microbatch=32 + concurrent=32 | **44 s** |
+
+Full 200-problem gate at microbatch=32 + concurrent=32: **3:01** wall.
+
+From the post-gate region table:
+
+| region | n | mean_ms | p50_ms | p99_ms |
+|---|---|---|---|---|
+| `engine.generate` (whole request) | 220 | 24407 | 18654 | 41147 |
+| `engine.model.generate` (one batch) | 9 | 23575 | 18551 | 36992 |
+| `engine.batch.tokenize` | 9 | 35 | 39 | 61 |
+| `engine.batch.render` | 9 | 22 | 27 | 32 |
+| `engine.batch.decode` | 9 | 8 | 10 | 14 |
+
+The batching scaffolding is **0.3% of batch time** — it's pure model
+forward time at this stage. Avg batch size 24.4 (concurrent=32 doesn't
+fully fill because requests trickle in). Phase 2 attacks the model.generate
+slab via TP=8 + paged KV + continuous batching + CUDA graphs.
 
 These are correctness-iteration numbers, not the final throughput numbers
 we'll be scored on. The throughput sweep at high concurrency (where
