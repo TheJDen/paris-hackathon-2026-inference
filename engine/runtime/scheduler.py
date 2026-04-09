@@ -122,7 +122,7 @@ class Scheduler:
                     seq.status = SequenceStatus.PREFILLING
                     seq.prefill_started_at = time.perf_counter()
                     try:
-                        first_token = self.runner.prefill(slot_id, seq.prompt_token_ids)
+                        first_token = self.runner.prefill(slot_id, seq.prompt_token_ids, seq.sampling)
                     except Exception as e:
                         log.exception("prefill failed for %s: %s", seq.request_id, e)
                         seq.status = SequenceStatus.FAILED
@@ -162,9 +162,10 @@ class Scheduler:
                     # to write it at position prompt_len + (output_len - 1)
                     # which equals total_len - 1. That's what's above.
 
+                    samplings = [s.sampling for s in seqs]
                     try:
                         next_tokens = self.runner.decode(
-                            slot_ids, last_tokens, cache_lengths
+                            slot_ids, last_tokens, cache_lengths, samplings
                         )
                     except Exception as e:
                         log.exception("decode step failed: %s", e)

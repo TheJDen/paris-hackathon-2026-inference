@@ -411,24 +411,63 @@ class SlotPoolCache:
         B, H, L, D = key_states.shape
         assert B == batch.batch_size, f"batch mismatch: K has {B}, batch says {batch.batch_size}"
 
-        # Per-row write — vectorize later. The HF (B, H, L, D) layout has
-        # heads in dim 1; we permute to (L, H, D) per row before storing.
-        for b in range(B):
-            slot_id = int(batch.slot_ids[b])
-            positions = batch.write_positions[b]
-            layer.k[slot_id, positions, :, :] = key_states[b].permute(1, 0, 2).to(layer.k.dtype)
-            layer.v[slot_id, positions, :, :] = value_states[b].permute(1, 0, 2).to(layer.v.dtype)
-            self.slot_lengths[slot_id] = batch.kv_seq_lens[b]
+        # ---- Vectorized write ------------------------------------------------
+        # Build flat (slot_idx, position) index pairs covering all (b, l) pairs.
+        # write_positions is list[Tensor], variable length per row (though in
+        # practice all rows share the same L: =1 for decode, =prompt_len for
+        # B=1 prefill).  We cat to get a single flat positions vector and
+        # repeat each slot_id once per position.
+        slot_ids_long = batch.slot_ids.long()  # [B]
+        write_pos_list = batch.write_positions  # list of B int64 tensors
+        # Lengths per row: tensor [B] of ints (each == L in uniform case).
+        pos_lens = torch.tensor(
+            [p.shape[0] for p in write_pos_list],
+            dtype=torch.int64,
+            device=layer.k.device,
+        )  # [B]
+        # Flat position indices: [total_tokens]
+        flat_positions = torch.cat(write_pos_list)  # [total_tokens]
+        # Repeat each slot_id pos_lens[b] times: [total_tokens]
+        flat_slot_ids = slot_ids_long.repeat_interleave(pos_lens)  # [total_tokens]
 
-        # Read step: build a padded [B, H, S, D] view where S = max kv_seq_len.
+        # key_states / value_states: [B, H, L, D] → [B, L, H, D] → [total, H, D]
+        # (When L is uniform this is a simple reshape; for variable L we need
+        # to flatten across the list.  Use the general cat path.)
+        k_flat = torch.cat(
+            [key_states[b].permute(1, 0, 2) for b in range(B)]
+        ).to(layer.k.dtype)   # [total_tokens, H, D]
+        v_flat = torch.cat(
+            [value_states[b].permute(1, 0, 2) for b in range(B)]
+        ).to(layer.v.dtype)   # [total_tokens, H, D]
+
+        layer.k[flat_slot_ids, flat_positions] = k_flat
+        layer.v[flat_slot_ids, flat_positions] = v_flat
+
+        # Update slot lengths in one shot (decode: all B rows; prefill: B==1).
+        self.slot_lengths.index_copy_(0, slot_ids_long, batch.kv_seq_lens.long())
+
+        # ---- Vectorized read -------------------------------------------------
+        # Gather all slot rows in one call → [B, max_seq_len, H, D]
         max_s = int(batch.kv_seq_lens.max().item())
-        out_k = torch.zeros(B, H, max_s, D, dtype=layer.k.dtype, device=layer.k.device)
-        out_v = torch.zeros_like(out_k)
-        for b in range(B):
-            slot_id = int(batch.slot_ids[b])
-            seq_len = int(batch.kv_seq_lens[b])
-            out_k[b, :, :seq_len, :] = layer.k[slot_id, :seq_len].permute(1, 0, 2)
-            out_v[b, :, :seq_len, :] = layer.v[slot_id, :seq_len].permute(1, 0, 2)
+        gathered_k = torch.index_select(layer.k, 0, slot_ids_long)  # [B, max_seq_len, H, D]
+        gathered_v = torch.index_select(layer.v, 0, slot_ids_long)  # [B, max_seq_len, H, D]
+
+        # Slice to the active window and permute to [B, H, max_s, D].
+        out_k = gathered_k[:, :max_s, :, :].permute(0, 2, 1, 3).contiguous()
+        out_v = gathered_v[:, :max_s, :, :].permute(0, 2, 1, 3).contiguous()
+
+        # Zero-out tail tokens for rows whose kv_seq_len < max_s so that
+        # attention scores on padding positions are forced to zero (matching
+        # the prior loop behaviour of writing only [:seq_len] into zeros).
+        # Build mask [B, 1, max_s, 1]: True where position < kv_seq_len[b].
+        if max_s > 1:
+            # arange [1, 1, max_s, 1] vs kv_seq_lens [B, 1, 1, 1]
+            pos_range = torch.arange(max_s, device=layer.k.device).view(1, 1, max_s, 1)
+            kv_lens = batch.kv_seq_lens.view(B, 1, 1, 1)  # [B,1,1,1]
+            valid_mask = pos_range < kv_lens  # [B, 1, max_s, 1] bool
+            out_k = out_k * valid_mask
+            out_v = out_v * valid_mask
+
         return out_k, out_v
 
     # --------------------------------------------------------------- linear-attention updates

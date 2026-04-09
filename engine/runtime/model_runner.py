@@ -26,6 +26,7 @@ import torch
 
 from engine.runtime.kv_cache import BatchSlots, SlotPoolCache
 from engine.runtime.profiling import time_region
+from engine.runtime.sequence import SamplingParams
 
 if TYPE_CHECKING:
     pass
@@ -106,7 +107,7 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
 
     @torch.inference_mode()
-    def prefill(self, slot_id: int, prompt_token_ids: list[int]) -> int:
+    def prefill(self, slot_id: int, prompt_token_ids: list[int], sampling: SamplingParams | None = None) -> int:
         """Prefill one slot with its prompt and return the first sampled token.
 
         Phase 2a v0: prefill one slot at a time. Phase 2b will batch
@@ -155,7 +156,15 @@ class ModelRunner:
                 logits = self.lm_head(last_hidden)  # [1, 1, vocab]
 
             with time_region("runner.prefill.sample"):
-                next_token_id = int(self._sample_greedy(logits[:, -1, :]).item())
+                temps = torch.tensor(
+                    [sampling.temperature if sampling is not None else 0.0],
+                    dtype=torch.float32, device=self.device,
+                )
+                top_ps = torch.tensor(
+                    [sampling.top_p if sampling is not None else 1.0],
+                    dtype=torch.float32, device=self.device,
+                )
+                next_token_id = int(self._sample(logits[:, -1, :], temps, top_ps).item())
 
             return next_token_id
 
@@ -165,11 +174,13 @@ class ModelRunner:
         slot_ids: list[int],
         last_tokens: list[int],
         cache_lengths: list[int],
+        samplings: list[SamplingParams] | None = None,
     ) -> list[int]:
         """Run one decode step for B slots, return next-token id per slot.
 
         `cache_lengths[i]` is the slot's CURRENT cached length BEFORE this
         step (i.e. the position the new token lands at).
+        `samplings[i]` holds temperature/top_p for the i-th row.
         """
         with time_region("runner.decode"):
             B = len(slot_ids)
@@ -224,16 +235,98 @@ class ModelRunner:
                 logits = self.lm_head(hidden_states[:, -1, :])  # [B, vocab]
 
             with time_region("runner.decode.sample"):
-                next_tokens = self._sample_greedy(logits)  # [B]
+                if samplings is not None:
+                    temps = torch.tensor(
+                        [s.temperature for s in samplings],
+                        dtype=torch.float32, device=self.device,
+                    )
+                    top_ps = torch.tensor(
+                        [s.top_p for s in samplings],
+                        dtype=torch.float32, device=self.device,
+                    )
+                else:
+                    temps = torch.zeros(B, dtype=torch.float32, device=self.device)
+                    top_ps = torch.ones(B, dtype=torch.float32, device=self.device)
+                next_tokens = self._sample(logits, temps, top_ps)  # [B]
             return [int(t.item()) for t in next_tokens]
 
     # ------------------------------------------------------------------ #
-    # sampling — greedy only for v0; temp/top_p come next
+    # sampling — greedy fast-path + temperature / top-p nucleus sampling
     # ------------------------------------------------------------------ #
 
-    def _sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
-        """Argmax over the vocab dimension. Returns a 1-D int64 tensor."""
-        return torch.argmax(logits, dim=-1)
+    def _sample(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-row sampler supporting greedy argmax and temperature+top-p.
+
+        Args:
+            logits:       [B, vocab_size]  — raw logits from lm_head (fp32 or bf16)
+            temperatures: [B]              — 0.0 means greedy for that row
+            top_ps:       [B]              — nucleus cutoff; >=1.0 means no masking
+
+        Returns:
+            [B] int64 tensor of sampled token ids.
+
+        top_k: SamplingParams does not currently have a top_k field, so top_k
+        is not implemented. Add SamplingParams.top_k and a masking step here
+        when needed.
+        """
+        # Fast-path: if every row is greedy, skip all stochastic logic.
+        if bool((temperatures <= 0.0).all()):
+            return torch.argmax(logits, dim=-1)
+
+        B, vocab = logits.shape
+        # Work in float32 for numerical stability.
+        logits_f = logits.float()  # [B, vocab]
+
+        # --- per-row dispatch ---
+        # Rows where temperature==0 → argmax; others → stochastic.
+        greedy_mask = temperatures <= 0.0  # [B] bool
+
+        # --- stochastic rows: apply temperature and top-p ---
+        # Scale logits by temperature (broadcast over vocab).
+        # temperatures shape: [B] → [B, 1] for broadcasting.
+        temps_safe = temperatures.clamp(min=1e-6).unsqueeze(1)  # [B, 1]
+        scaled = logits_f / temps_safe  # [B, vocab]
+
+        # Top-p (nucleus) filtering.
+        # Sort descending so the highest-prob tokens come first.
+        sorted_logits, sorted_indices = torch.sort(scaled, dim=-1, descending=True)
+        cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)  # [B, vocab]
+
+        # Shift cumprobs right by one so that the token that pushes cumsum
+        # over top_p is still included (standard nucleus formulation).
+        cumprobs_shifted = torch.roll(cumprobs, shifts=1, dims=-1)
+        cumprobs_shifted[:, 0] = 0.0
+
+        # Build a mask: True for tokens to REMOVE (cumprob already exceeded top_p).
+        # top_ps shape: [B] → [B, 1] for broadcasting.
+        remove_mask = cumprobs_shifted > top_ps.unsqueeze(1)  # [B, vocab]
+
+        # Rows where top_p >= 1.0: disable masking (no filtering).
+        no_topp_mask = (top_ps >= 1.0).unsqueeze(1)  # [B, 1]
+        remove_mask = remove_mask & ~no_topp_mask
+
+        # Apply mask (fill removed positions with -inf in sorted order).
+        sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+
+        # Convert back to the original vocab ordering.
+        filtered_logits = torch.zeros_like(sorted_logits)
+        filtered_logits.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
+
+        # Sample from the filtered distribution.
+        probs = torch.softmax(filtered_logits, dim=-1)  # [B, vocab]
+        stochastic_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+
+        # Greedy tokens (argmax on the original logits, not scaled).
+        greedy_tokens = torch.argmax(logits_f, dim=-1)  # [B]
+
+        # Merge: use greedy where temperature==0, stochastic elsewhere.
+        result = torch.where(greedy_mask, greedy_tokens, stochastic_tokens)
+        return result
 
     # ------------------------------------------------------------------ #
     # diagnostics
