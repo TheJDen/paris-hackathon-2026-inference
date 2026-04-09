@@ -84,6 +84,8 @@ class Engine:
         profile_torch_after_batches: int = 0,
         profile_torch_min_batch_size: int = 1,
         profile_torch_tag: str = "run",
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
     ) -> None:
         self.model_name = model_name
         self.stub = stub
@@ -92,6 +94,8 @@ class Engine:
         self.max_model_len = max_model_len
         self.device = device
         self.attn_impl = attn_impl
+        self.ep_rank = ep_rank
+        self.ep_world_size = ep_world_size
 
         # One-shot torch.profiler capture: skip the first N batches as
         # warmup, then capture the FIRST batch (decode step) after that
@@ -144,6 +148,8 @@ class Engine:
                 self.model_name,
                 device=self.device,
                 attn_impl=self.attn_impl,
+                ep_rank=self.ep_rank,
+                ep_world_size=self.ep_world_size,
             )
         self._loaded = loaded
 
@@ -160,6 +166,8 @@ class Engine:
                 device=loaded.device,
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
+                ep_rank=self.ep_rank,
+                ep_world_size=self.ep_world_size,
             )
             log.info(
                 "model runner ready: cache_mem=%.2f GB", self.runner.cache_memory_gb()

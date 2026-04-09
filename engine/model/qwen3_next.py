@@ -89,6 +89,8 @@ def load_model(
     device: str | torch.device = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
     attn_impl: str = "sdpa",
+    ep_rank: int = 0,
+    ep_world_size: int = 1,
 ) -> LoadedModel:
     """Load Qwen3.5-35B-A3B as a text-only causal LM.
 
@@ -151,6 +153,11 @@ def load_model(
             model = full
 
     model.eval()
+
+    if ep_world_size > 1:
+        from engine.model.ep import patch_model_for_ep
+        patch_model_for_ep(model, ep_rank, ep_world_size)
+
     return LoadedModel(
         model=model,
         tokenizer=tokenizer,

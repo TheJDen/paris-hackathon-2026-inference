@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
+import torch
+import torch.distributed as dist
 import uvicorn
 
 from engine.runtime.engine import Engine
@@ -83,12 +86,24 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     args = parse_args()
 
+    # Distributed setup — torchrun sets LOCAL_RANK / WORLD_SIZE when EP > 1.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+        log.info("EP rank %d / %d — device %s", local_rank, world_size, device)
+    else:
+        device = args.device
+
     if args.profile_torch or args.profile_torch_after_batches > 0:
         enable_torch_profiler(tag=args.profile_tag)
 
     log.info(
-        "building engine model=%s stub=%s tp=%d max_batch=%d max_model_len=%d",
+        "building engine model=%s stub=%s tp=%d max_batch=%d max_model_len=%d ep=%d/%d",
         args.model, args.stub, args.tp, args.max_batch, args.max_model_len,
+        local_rank, world_size,
     )
     engine = Engine.build(
         args.model,
@@ -96,13 +111,22 @@ def main() -> None:
         tp=args.tp,
         max_batch=args.max_batch,
         max_model_len=args.max_model_len,
-        device=args.device,
+        device=device,
         attn_impl=args.attn_impl,
         batch_window_ms=args.batch_window_ms,
         profile_torch_after_batches=args.profile_torch_after_batches,
         profile_torch_min_batch_size=args.profile_torch_min_batch_size,
         profile_torch_tag=args.profile_tag,
+        ep_rank=local_rank,
+        ep_world_size=world_size,
     )
+
+    # Worker ranks (1-7) just run the EP receive loop — no HTTP server.
+    if local_rank > 0:
+        log.info("EP worker rank %d entering receive loop", local_rank)
+        assert engine.runner is not None
+        engine.runner.run_worker_loop()
+        return
 
     if args.metrics_interval > 0:
         metrics.start_flusher(interval_s=args.metrics_interval)

@@ -23,9 +23,15 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 
 from engine.runtime.kv_cache import BatchSlots, SlotPoolCache
 from engine.runtime.profiling import time_region
+
+# EP coordination command codes (broadcast as 1-element int64 tensor).
+_EP_CMD_EXIT    = 0
+_EP_CMD_PREFILL = 1
+_EP_CMD_DECODE  = 2
 
 if TYPE_CHECKING:
     from engine.runtime.sequence import SamplingParams
@@ -48,12 +54,16 @@ class ModelRunner:
         *,
         num_slots: int,
         max_seq_len: int,
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
     ) -> None:
         self.hf_model = hf_model
         self.text_config = text_config
         self.device = device
         self.num_slots = num_slots
         self.max_seq_len = max_seq_len
+        self.ep_rank = ep_rank
+        self.ep_world_size = ep_world_size
 
         # The inner Qwen3_5MoeTextModel where layers/embed/norm live.
         self.inner_model = getattr(hf_model, "model", hf_model)
@@ -122,11 +132,23 @@ class ModelRunner:
         rows share the same input length. Only real-token K/V is written to
         the cache (padding positions are sliced away in cache.update()).
 
-        Note: DeltaNet recurrent state is computed over the padded sequence,
-        meaning pad tokens after the last real token contribute to the final
-        state. For the throughput eval all prompts have the same length so
-        there is no padding and this is a non-issue.
+        If sequences have different prompt lengths, falls back to individual
+        prefills to avoid DeltaNet recurrent state contamination from
+        right-padding tokens (30/40 layers are DeltaNet; pad tokens corrupt
+        the recurrent state for any shorter sequence in the batch).
         """
+        prompt_lens = [len(p) for p in prompt_token_ids_list]
+        if len(set(prompt_lens)) > 1:
+            # Mixed lengths: process individually to avoid contamination.
+            results = []
+            for i in range(len(slot_ids)):
+                results.extend(
+                    self.prefill_batch(
+                        [slot_ids[i]], [prompt_token_ids_list[i]], [samplings[i]]
+                    )
+                )
+            return results
+
         with time_region("runner.prefill"):
             B = len(slot_ids)
             prompt_lens = [len(p) for p in prompt_token_ids_list]
@@ -166,6 +188,13 @@ class ModelRunner:
                     is_prefill=True,
                 )
             )
+
+            if self.ep_world_size > 1:
+                self._ep_broadcast_prefill(
+                    input_ids, attention_mask, position_ids,
+                    slot_ids_t, kv_seq_lens, query_lens,
+                    torch.tensor(prompt_lens, dtype=torch.int64, device=self.device),
+                )
 
             with time_region("runner.prefill.model_forward"):
                 outputs = self.inner_model(
@@ -245,6 +274,12 @@ class ModelRunner:
             positions = torch.arange(max_s, dtype=torch.long, device=self.device).unsqueeze(0)
             attention_mask = (positions < kv_seq_lens.unsqueeze(1)).long()
 
+            if self.ep_world_size > 1:
+                self._ep_broadcast_decode(
+                    input_ids, attention_mask, position_ids,
+                    slot_ids_t, kv_seq_lens, query_lens,
+                )
+
             with time_region("runner.decode.model_forward"):
                 outputs = self.inner_model(
                     input_ids=input_ids,
@@ -314,6 +349,126 @@ class ModelRunner:
             sampled = torch.where(greedy_mask, greedy_tokens, sampled)
 
         return sampled
+
+    # ------------------------------------------------------------------ #
+    # Expert Parallelism — rank-0 broadcast helpers + worker loop
+    # ------------------------------------------------------------------ #
+
+    def _ep_broadcast_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        slot_ids: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
+        query_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+    ) -> None:
+        """Rank 0: send CMD_PREFILL + all forward inputs to workers."""
+        B, max_len = input_ids.shape
+        cmd = torch.tensor([_EP_CMD_PREFILL], dtype=torch.int64, device=self.device)
+        dist.broadcast(cmd, src=0)
+        meta = torch.tensor([B, max_len, max_len], dtype=torch.int64, device=self.device)
+        dist.broadcast(meta, src=0)
+        dist.broadcast(input_ids.contiguous(), src=0)
+        dist.broadcast(attention_mask.contiguous(), src=0)
+        dist.broadcast(position_ids.contiguous(), src=0)
+        dist.broadcast(slot_ids.contiguous(), src=0)
+        dist.broadcast(kv_seq_lens.contiguous(), src=0)
+        dist.broadcast(query_lens.contiguous(), src=0)
+        dist.broadcast(prompt_lens.contiguous(), src=0)
+
+    def _ep_broadcast_decode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        slot_ids: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
+        query_lens: torch.Tensor,
+    ) -> None:
+        """Rank 0: send CMD_DECODE + all forward inputs to workers."""
+        B = input_ids.shape[0]
+        max_s = attention_mask.shape[1]
+        cmd = torch.tensor([_EP_CMD_DECODE], dtype=torch.int64, device=self.device)
+        dist.broadcast(cmd, src=0)
+        meta = torch.tensor([B, 1, max_s], dtype=torch.int64, device=self.device)
+        dist.broadcast(meta, src=0)
+        dist.broadcast(input_ids.contiguous(), src=0)
+        dist.broadcast(attention_mask.contiguous(), src=0)
+        dist.broadcast(position_ids.contiguous(), src=0)
+        dist.broadcast(slot_ids.contiguous(), src=0)
+        dist.broadcast(kv_seq_lens.contiguous(), src=0)
+        dist.broadcast(query_lens.contiguous(), src=0)
+
+    @torch.inference_mode()
+    def _ep_recv_and_run(self, is_prefill: bool) -> None:
+        """Workers (ranks 1-7): receive broadcast, run forward, discard output."""
+        device = self.device
+
+        meta = torch.zeros(3, dtype=torch.int64, device=device)
+        dist.broadcast(meta, src=0)
+        B, input_len, attn_len = int(meta[0]), int(meta[1]), int(meta[2])
+
+        input_ids      = torch.empty(B, input_len, dtype=torch.long, device=device)
+        attention_mask = torch.empty(B, attn_len,  dtype=torch.long, device=device)
+        position_ids   = torch.empty(B, input_len, dtype=torch.long, device=device)
+        slot_ids       = torch.empty(B, dtype=torch.int64, device=device)
+        kv_seq_lens    = torch.empty(B, dtype=torch.int64, device=device)
+        query_lens     = torch.empty(B, dtype=torch.int64, device=device)
+
+        dist.broadcast(input_ids, src=0)
+        dist.broadcast(attention_mask, src=0)
+        dist.broadcast(position_ids, src=0)
+        dist.broadcast(slot_ids, src=0)
+        dist.broadcast(kv_seq_lens, src=0)
+        dist.broadcast(query_lens, src=0)
+
+        if is_prefill:
+            prompt_lens = torch.empty(B, dtype=torch.int64, device=device)
+            dist.broadcast(prompt_lens, src=0)
+            write_positions = [
+                torch.arange(int(prompt_lens[b]), dtype=torch.int64, device=device)
+                for b in range(B)
+            ]
+        else:
+            write_positions = [
+                (kv_seq_lens[b : b + 1] - 1)
+                for b in range(B)
+            ]
+
+        self.cache.set_batch(BatchSlots(
+            slot_ids=slot_ids,
+            write_positions=write_positions,
+            query_lens=query_lens,
+            kv_seq_lens=kv_seq_lens,
+            is_prefill=is_prefill,
+        ))
+        self.inner_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=self.cache,
+            use_cache=True,
+        )
+        self.cache.commit_batch()
+
+    def run_worker_loop(self) -> None:
+        """Blocking loop for EP worker ranks (1-7). Never returns normally."""
+        log.info("EP worker rank=%d starting loop", self.ep_rank)
+        cmd = torch.zeros(1, dtype=torch.int64, device=self.device)
+        while True:
+            dist.broadcast(cmd, src=0)
+            c = int(cmd[0])
+            if c == _EP_CMD_EXIT:
+                log.info("EP worker rank=%d received EXIT", self.ep_rank)
+                break
+            elif c == _EP_CMD_PREFILL:
+                self._ep_recv_and_run(is_prefill=True)
+            elif c == _EP_CMD_DECODE:
+                self._ep_recv_and_run(is_prefill=False)
+            else:
+                log.warning("EP worker rank=%d unknown cmd=%d", self.ep_rank, c)
 
     # ------------------------------------------------------------------ #
     # diagnostics

@@ -10,7 +10,8 @@
 # Usage:
 #   ./scripts/start.sh                          # default model, port 8000
 #   PORT=9000 ./scripts/start.sh --stub         # Phase 0 smoke run
-#   ./scripts/start.sh --tp 8                   # Phase 1+
+#   ./scripts/start.sh --tp 8                   # Phase 1 TP (unused)
+#   EP=8 ./scripts/start.sh                     # Expert Parallelism across 8 GPUs
 #
 set -euo pipefail
 
@@ -18,21 +19,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-8888}"
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
 LOG_FILE="${LOG_FILE:-${PROJECT_DIR}/server.log}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-600}"
 
 PYTHON="${PYTHON:-python}"
 
-echo "[start.sh] launching server: model=${MODEL} port=${PORT} log=${LOG_FILE}"
-nohup "$PYTHON" -m server.main \
-    --model "$MODEL" \
-    --port "$PORT" \
-    "$@" \
-    >"$LOG_FILE" 2>&1 &
+# EP=8 uses torchrun to spawn one process per GPU; each rank loads the model
+# with only its shard of expert weights, cutting GPU memory from ~70 GB to
+# ~17.5 GB per rank and parallelising the MoE forward across 8 GPUs.
+EP="${EP:-8}"
 
-SERVER_PID=$!
+if [ "$EP" -gt 1 ]; then
+    echo "[start.sh] launching EP=${EP} server: model=${MODEL} port=${PORT} log=${LOG_FILE}"
+    nohup torchrun \
+        --standalone \
+        --nproc_per_node="$EP" \
+        -m server.main \
+        --model "$MODEL" \
+        --port "$PORT" \
+        "$@" \
+        >"$LOG_FILE" 2>&1 &
+else
+    echo "[start.sh] launching server: model=${MODEL} port=${PORT} log=${LOG_FILE}"
+    nohup "$PYTHON" -m server.main \
+        --model "$MODEL" \
+        --port "$PORT" \
+        "$@" \
+        >"$LOG_FILE" 2>&1 &
+fi
+
+SERVER_PID=$!  # works for both nohup paths above
 echo "[start.sh] server pid=${SERVER_PID}"
 
 # Detach so the server outlives this script.
