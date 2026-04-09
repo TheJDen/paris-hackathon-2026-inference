@@ -58,6 +58,12 @@ class SchedulerConfig:
     max_seq_len: int = 4096
     # Hard caps to keep one step bounded.
     max_decode_batch: int = 64
+    # How many sequences to admit and prefill in a single step. Admitting
+    # more sequences per step amortises scheduler overhead over the batch and
+    # fills the decode pool faster at high concurrency. Default 8 is a
+    # conservative starting point; increase toward 16–32 if GPU memory allows.
+    # TODO: expose via CLI / server config (currently hardcoded in SchedulerConfig).
+    max_prefill_batch: int = 8
     # Soft co-scheduling knob: how many steps of decode we let happen between
     # prefill admissions, when there are sequences waiting AND decoding.
     decode_steps_per_prefill: int = 1
@@ -116,28 +122,49 @@ class Scheduler:
 
             if should_prefill:
                 with time_region("scheduler.admit_prefill"):
-                    seq = self.waiting.popleft()
-                    slot_id = self.free_slots.popleft()
-                    seq.slot_idx = slot_id
-                    seq.status = SequenceStatus.PREFILLING
-                    seq.prefill_started_at = time.perf_counter()
+                    # Admit up to max_prefill_batch sequences in one step.
+                    # This amortises scheduler overhead over the whole batch
+                    # and fills the decode pool faster at high concurrency.
+                    batch_seqs: list[Sequence] = []
+                    prefill_t0 = time.perf_counter()
+                    for _ in range(self.config.max_prefill_batch):
+                        if not self.waiting or not self.free_slots:
+                            break
+                        seq = self.waiting.popleft()
+                        slot_id = self.free_slots.popleft()
+                        seq.slot_idx = slot_id
+                        seq.status = SequenceStatus.PREFILLING
+                        seq.prefill_started_at = prefill_t0
+                        batch_seqs.append(seq)
+
                     try:
-                        first_token = self.runner.prefill(slot_id, seq.prompt_token_ids, seq.sampling)
+                        first_tokens = self.runner.prefill_batch(
+                            [s.slot_idx for s in batch_seqs],
+                            [s.prompt_token_ids for s in batch_seqs],
+                            [s.sampling for s in batch_seqs],
+                        )
                     except Exception as e:
-                        log.exception("prefill failed for %s: %s", seq.request_id, e)
-                        seq.status = SequenceStatus.FAILED
-                        if not seq.future.done():
-                            seq.future.set_exception(e)
-                        self.free_slots.append(slot_id)
-                        return [seq]
-                    seq.append_output_token(first_token)
-                    seq.prefill_done_at = time.perf_counter()
-                    if seq.maybe_finish():
-                        finished.append(seq)
-                        self._free_slot(seq)
-                    else:
-                        seq.status = SequenceStatus.RUNNING
-                        self.running[slot_id] = seq
+                        log.exception(
+                            "prefill_batch failed for %d seqs: %s",
+                            len(batch_seqs), e,
+                        )
+                        for seq in batch_seqs:
+                            seq.status = SequenceStatus.FAILED
+                            if not seq.future.done():
+                                seq.future.set_exception(e)
+                            self.free_slots.append(seq.slot_idx)
+                        return [s for s in batch_seqs]
+
+                    prefill_done_t = time.perf_counter()
+                    for seq, first_token in zip(batch_seqs, first_tokens):
+                        seq.append_output_token(first_token)
+                        seq.prefill_done_at = prefill_done_t
+                        if seq.maybe_finish():
+                            finished.append(seq)
+                            self._free_slot(seq)
+                        else:
+                            seq.status = SequenceStatus.RUNNING
+                            self.running[seq.slot_idx] = seq
                     self._steps_since_prefill = 0
 
             # 2. Decode all running sequences (one token each).

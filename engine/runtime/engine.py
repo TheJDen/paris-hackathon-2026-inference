@@ -80,6 +80,7 @@ class Engine:
         max_model_len: int = 4096,
         device: str = "cuda:0",
         attn_impl: str = "sdpa",
+        max_prefill_batch: int = 8,
         batch_window_ms: float = 5.0,  # legacy CLI arg, ignored by Phase 2a
         profile_torch_after_batches: int = 0,
         profile_torch_min_batch_size: int = 1,
@@ -92,6 +93,7 @@ class Engine:
         self.max_model_len = max_model_len
         self.device = device
         self.attn_impl = attn_impl
+        self.max_prefill_batch = max_prefill_batch
 
         # One-shot torch.profiler capture: skip the first N batches as
         # warmup, then capture the FIRST batch (decode step) after that
@@ -171,6 +173,7 @@ class Engine:
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
                 max_decode_batch=self.max_batch,
+                max_prefill_batch=self.max_prefill_batch,
             ),
         )
 

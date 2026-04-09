@@ -169,6 +169,34 @@ class ModelRunner:
             return next_token_id
 
     @torch.inference_mode()
+    def prefill_batch(
+        self,
+        slot_ids: list[int],
+        prompt_token_ids_list: list[list[int]],
+        samplings: list,
+    ) -> list[int]:
+        """Prefill B slots in one scheduling decision.
+
+        v0 implementation: Python loop over B prompts, each calling the
+        single-slot prefill path. This is "batched in scheduling" — we pay
+        the scheduler overhead only once for all B sequences, which cuts the
+        ramp-up time from ~B*step_latency to ~step_latency. Real batched
+        compute (padded forward over B sequences) is the next step and
+        requires extending the cache write API to mask pad positions; that
+        is left as a TODO for the follow-up PR.
+
+        Returns a list of B first-token ids, one per sequence.
+        """
+        with time_region("runner.prefill_batch"):
+            first_tokens: list[int] = []
+            for slot_id, prompt_token_ids, sampling in zip(
+                slot_ids, prompt_token_ids_list, samplings
+            ):
+                first_token = self.prefill(slot_id, prompt_token_ids, sampling)
+                first_tokens.append(first_token)
+            return first_tokens
+
+    @torch.inference_mode()
     def decode(
         self,
         slot_ids: list[int],
