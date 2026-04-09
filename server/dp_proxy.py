@@ -66,6 +66,7 @@ class BackendState:
         self.url = url.rstrip("/")
         self._down_until: float = 0.0  # epoch-seconds; 0 means healthy
         self.inflight: int = 0         # active forwarded requests
+        self.picks_total: int = 0      # lifetime count of times this backend was picked
 
     def is_healthy(self) -> bool:
         return time.monotonic() >= self._down_until
@@ -95,21 +96,58 @@ class DPProxy:
         self.port = port
         self._backends = [BackendState(url) for url in backends]
         self._session: ClientSession | None = None
+        self._rr_index: int = 0  # round-robin tie-breaker among equal-load backends
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _next_backend(self) -> BackendState | None:
-        """Return the healthy backend with the fewest in-flight requests.
+    def _pick_backend(
+        self, exclude_urls: set[str] | None = None
+    ) -> BackendState | None:
+        """Pick a healthy backend and ATOMICALLY claim it (inflight += 1).
 
-        Falls back to round-robin among equal-load backends for tie-breaking.
-        Returns None only when all backends are down.
+        The caller is responsible for decrementing `inflight` in a finally block
+        once the forwarded request completes (or errors).
+
+        Why claim-at-pick? Under high concurrency (e.g. 64 requests fanning out
+        in a single event-loop tick), all handlers may call this between
+        awaits. If we incremented `inflight` only after the upstream await,
+        every concurrent handler would observe the same `min(inflight=0)` and
+        stampede onto rank 0. Claiming synchronously at pick time is the only
+        way to make least-loaded routing actually spread load.
+
+        Ties are broken via round-robin so that N simultaneous picks with all
+        inflight==0 go to N distinct backends.
         """
-        healthy = [b for b in self._backends if b.is_healthy()]
+        healthy = [
+            b for b in self._backends
+            if b.is_healthy() and (exclude_urls is None or b.url not in exclude_urls)
+        ]
         if not healthy:
             return None
-        return min(healthy, key=lambda b: b.inflight)
+
+        min_inflight = min(b.inflight for b in healthy)
+        candidates = [b for b in healthy if b.inflight == min_inflight]
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            # Round-robin among equally-loaded backends. Walk _backends in
+            # index order starting from _rr_index so the cycle is stable.
+            n = len(self._backends)
+            chosen = candidates[0]
+            for offset in range(n):
+                idx = (self._rr_index + offset) % n
+                cand = self._backends[idx]
+                if cand in candidates:
+                    chosen = cand
+                    self._rr_index = (idx + 1) % n
+                    break
+
+        chosen.inflight += 1
+        chosen.picks_total += 1
+        return chosen
 
     def _healthy_backends(self) -> list[BackendState]:
         return [b for b in self._backends if b.is_healthy()]
@@ -154,16 +192,12 @@ class DPProxy:
         last_err: str = "no backends available"
 
         while len(attempted_urls) < n:
-            backend = self._next_backend()
+            backend = self._pick_backend(exclude_urls=attempted_urls)
             if backend is None:
-                break
-            if backend.url in attempted_urls:
-                # All healthy backends tried; break to avoid infinite loop.
                 break
             attempted_urls.add(backend.url)
 
             url = f"{backend.url}/v1/chat/completions"
-            backend.inflight += 1
             rank = self._backends.index(backend)
             try:
                 async with session.post(
@@ -354,6 +388,9 @@ class DPProxy:
         aggregated["dp_inflight"] = {
             str(i): b.inflight for i, b in enumerate(self._backends)
         }
+        aggregated["dp_picks_total"] = {
+            str(i): b.picks_total for i, b in enumerate(self._backends)
+        }
 
         return web.Response(
             status=200,
@@ -407,6 +444,12 @@ class DPProxy:
         app.router.add_get("/metrics/regions", self.handle_metrics_regions)
 
         async def _on_shutdown(app: web.Application) -> None:
+            # Log pick distribution so we can verify least-loaded routing
+            # actually spread traffic across backends.
+            dist = ", ".join(
+                f"rank{i}={b.picks_total}" for i, b in enumerate(self._backends)
+            )
+            log.info("dp_proxy shutdown pick distribution: %s", dist)
             if self._session and not self._session.closed:
                 await self._session.close()
 
