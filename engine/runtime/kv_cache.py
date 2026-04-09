@@ -430,14 +430,19 @@ class SlotPoolCache:
         # Repeat each slot_id pos_lens[b] times: [total_tokens]
         flat_slot_ids = slot_ids_long.repeat_interleave(pos_lens)  # [total_tokens]
 
-        # key_states / value_states: [B, H, L, D] → [B, L, H, D] → [total, H, D]
-        # (When L is uniform this is a simple reshape; for variable L we need
-        # to flatten across the list.  Use the general cat path.)
+        # key_states / value_states: [B, H, L, D] → [B, real_len_b, H, D] → [total, H, D]
+        # Slice each row to its real length (pos_lens[b]) before flattening.
+        # This is critical for batched prefill with right-padding: the model
+        # computes K/V for all B*max_L positions including pad tokens, but we
+        # only write the real (non-pad) positions into the cache.  Using the
+        # full L here would write garbage K/V from pad positions into the slot
+        # pool, corrupting subsequent decode steps.
+        real_lens = pos_lens.tolist()  # list[int], one per row
         k_flat = torch.cat(
-            [key_states[b].permute(1, 0, 2) for b in range(B)]
+            [key_states[b, :, :real_lens[b], :].permute(1, 0, 2) for b in range(B)]
         ).to(layer.k.dtype)   # [total_tokens, H, D]
         v_flat = torch.cat(
-            [value_states[b].permute(1, 0, 2) for b in range(B)]
+            [value_states[b, :, :real_lens[b], :].permute(1, 0, 2) for b in range(B)]
         ).to(layer.v.dtype)   # [total_tokens, H, D]
 
         layer.k[flat_slot_ids, flat_positions] = k_flat

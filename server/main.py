@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
         "skips smaller batches (e.g. per-level warmups) and waits for the next one",
     )
     p.add_argument("--profile-tag", default="run", help="tag for profile artifact names")
+    p.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable CUDA graph capture for the decode hot path (default: on). "
+        "Use --no-cuda-graphs to disable (e.g. for profiling eager kernels or "
+        "debugging). First call per bucket pays ~1-3s capture cost; subsequent "
+        "calls replay the graph with near-zero CPU dispatch overhead.",
+    )
     return p.parse_args()
 
 
@@ -102,6 +111,7 @@ def main() -> None:
         profile_torch_after_batches=args.profile_torch_after_batches,
         profile_torch_min_batch_size=args.profile_torch_min_batch_size,
         profile_torch_tag=args.profile_tag,
+        enable_cuda_graphs=args.cuda_graphs,
     )
 
     if args.metrics_interval > 0:

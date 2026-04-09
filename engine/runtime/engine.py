@@ -85,6 +85,7 @@ class Engine:
         profile_torch_after_batches: int = 0,
         profile_torch_min_batch_size: int = 1,
         profile_torch_tag: str = "run",
+        enable_cuda_graphs: bool = True,
     ) -> None:
         self.model_name = model_name
         self.stub = stub
@@ -103,6 +104,7 @@ class Engine:
         self._profile_tag = str(profile_torch_tag)
         self._profile_done = False
         self._batch_index = 0  # incremented per decode step
+        self._enable_cuda_graphs = bool(enable_cuda_graphs)
 
         self.tokenizer: ChatTokenizer | None = None
         self.runner = None
@@ -162,6 +164,7 @@ class Engine:
                 device=loaded.device,
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
+                enable_cuda_graphs=self._enable_cuda_graphs,
             )
             log.info(
                 "model runner ready: cache_mem=%.2f GB", self.runner.cache_memory_gb()
