@@ -1,18 +1,30 @@
 # STATUS
 
 **branch:** `main`
-**commit:** `8bb84f7` (`scheduler: revert length bucketing`)
+**best commit:** `8bb84f7` (`scheduler: revert length bucketing`)
+**latest commit:** `866e833` (TP=2 + EP scaffolding, untested)
 **date:** 2026-04-09
-**hardware:** single H200 (GPU 6) — DP across the full 8x H200 not yet wired
+**hardware:** single H200 — multi-GPU (DP/TP/EP) attempted, see below
 
-## Current best result
+## Locked-in best result
 
 | concurrency | tok/s | reqs ok | wall_s | vs vLLM baseline |
 |---:|---:|---:|---:|---:|
 | 64 | **951.4** | 64/64 | 88.5 | 7.4% (vLLM: 12810) |
 
-_config: c=64, num_requests=64, isl=1024, osl=1024_
+_config: c=64, num_requests=64, isl=1024, osl=1024, single H200, eager only_
 _artifact: `profiles/throughput_iter5_n64_152940.json`_
+
+## DP attempts (measured)
+
+| config | c=64 tok/s | notes |
+|---|---:|---|
+| Single engine (iter5) | **951** | best, locked in |
+| DP=4 (broken proxy, all-to-rank-0) | 719 | first attempt — bad routing |
+| DP=4 (routing fix, picks 17/23/22/21) | 930 | proxy correctly distributed; **still slower than single** |
+| DP=2, DP=3 | n/a | crashed before producing a clean number (port conflicts, OOM from teammate sharing, latent BatchSlots field bug) |
+
+**Why DP doesn't beat single at the eval cap of c=64:** every rank only sees 64/N concurrent requests, which is below the per-rank sweet spot. Single engine c=64 saturates one device's continuous batcher better than 4 partial batches across 4 devices. DP only helps when in-flight count > single-engine `max_batch`. The 1024+1024 / max=64 eval doesn't drive enough concurrency to make DP win.
 
 **Correctness sanity (greedy, temperature=0):**
 - API conformance: `eval/check_server.py` — PASS
@@ -65,6 +77,19 @@ The win at c=64 came almost entirely from changes 1, 2, 3, 5. The real
 batched prefill (5) compresses 8 sequential prefills (~800 ms eager) into
 one padded forward (~233 ms) — a 3.4× compression on the prefill compute
 itself, which removes most of the c=64 ramp-up stall.
+
+## Multi-GPU strategies attempted in the final hour
+
+**TP=2 from-scratch** (`engine/model/tp_shard.py`, commit `866e833`):
+- `ColumnParallelLinear` / `RowParallelLinear` with manual `dist.all_reduce` — pure `torch.distributed`, no third-party libs.
+- Shards full-attention `q/k/v/o_proj` (16 heads → 8/rank, 2 KV heads → 1/rank) and `shared_expert.{gate,up,down}_proj`.
+- Routed experts (256 per layer) stay replicated — that's the bulk of compute, so the win would be modest until expert sharding lands.
+- **Status: code shipped, not benched** — `start.sh` doesn't yet wire `torchrun --nproc-per-node=N` and the `init_tp_process_group()` env-var read isn't picking up RANK in time. Both are 1-line fixes for a fresh session.
+- Launch (post-fix): `torchrun --nproc_per_node=2 --master_port=29500 -m server.main --tp 2 ...`
+
+**EP from-scratch** (`engine/runtime/ep.py`, commit `866e833`):
+- Forward-only EP via NCCL. Each rank loads the full model, the patched MoE forward iterates only `experts[lo:hi)`, then `dist.all_reduce(SUM)` combines partials. Math is a line-for-line port of HF's `Qwen3NextSparseMoeBlock.forward`.
+- **Hard blocker**: worker ranks (1..N-1) sit in a passive `dist.barrier()` loop with no driver. Rank 0 hangs on the first all_reduce because there are no peers running the same forward in lockstep. Fixing this requires either (a) broadcasting `(input_ids, slot metadata)` from rank 0 at the top of every `scheduler.step` so all ranks run the same forward, or (b) replacing the all_reduce with a custom point-to-point worker loop. ~1 hour of plumbing.
 
 ## What's wired but disabled (broken)
 
