@@ -132,7 +132,7 @@ async def _sweep_no_spot(
                 f"{r['throughput_tok_per_sec']} tok/s",
                 f"({r['successful_requests']}/{num_requests} ok, {r['wall_time_sec']}s)",
             ]
-            if r["token_discrepancy"]:
+            if r.get("token_discrepancy"):
                 parts.append("[WARN: token count mismatch]")
             print(" ".join(parts))
             results.append(r)

@@ -58,6 +58,8 @@ class SchedulerConfig:
     max_seq_len: int = 4096
     # Hard caps to keep one step bounded.
     max_decode_batch: int = 64
+    # How many sequences to admit and prefill together in one forward pass.
+    max_prefill_batch: int = 32
     # Soft co-scheduling knob: how many steps of decode we let happen between
     # prefill admissions, when there are sequences waiting AND decoding.
     decode_steps_per_prefill: int = 1
@@ -116,28 +118,44 @@ class Scheduler:
 
             if should_prefill:
                 with time_region("scheduler.admit_prefill"):
-                    seq = self.waiting.popleft()
-                    slot_id = self.free_slots.popleft()
-                    seq.slot_idx = slot_id
-                    seq.status = SequenceStatus.PREFILLING
-                    seq.prefill_started_at = time.perf_counter()
+                    n_admit = min(
+                        len(self.waiting),
+                        len(self.free_slots),
+                        self.config.max_prefill_batch,
+                    )
+                    to_prefill: list[Sequence] = []
+                    for _ in range(n_admit):
+                        seq = self.waiting.popleft()
+                        slot_id = self.free_slots.popleft()
+                        seq.slot_idx = slot_id
+                        seq.status = SequenceStatus.PREFILLING
+                        seq.prefill_started_at = time.perf_counter()
+                        to_prefill.append(seq)
+
                     try:
-                        first_token = self.runner.prefill(slot_id, seq.prompt_token_ids)
+                        first_tokens = self.runner.prefill_batch(
+                            [s.slot_idx for s in to_prefill],
+                            [s.prompt_token_ids for s in to_prefill],
+                            [s.sampling for s in to_prefill],
+                        )
                     except Exception as e:
-                        log.exception("prefill failed for %s: %s", seq.request_id, e)
-                        seq.status = SequenceStatus.FAILED
-                        if not seq.future.done():
-                            seq.future.set_exception(e)
-                        self.free_slots.append(slot_id)
-                        return [seq]
-                    seq.append_output_token(first_token)
-                    seq.prefill_done_at = time.perf_counter()
-                    if seq.maybe_finish():
-                        finished.append(seq)
-                        self._free_slot(seq)
-                    else:
-                        seq.status = SequenceStatus.RUNNING
-                        self.running[slot_id] = seq
+                        log.exception("prefill_batch failed (%d seqs): %s", len(to_prefill), e)
+                        for seq in to_prefill:
+                            seq.status = SequenceStatus.FAILED
+                            if not seq.future.done():
+                                seq.future.set_exception(e)
+                            self.free_slots.append(seq.slot_idx)
+                        return to_prefill
+
+                    for seq, first_token in zip(to_prefill, first_tokens):
+                        seq.append_output_token(first_token)
+                        seq.prefill_done_at = time.perf_counter()
+                        if seq.maybe_finish():
+                            finished.append(seq)
+                            self._free_slot(seq)
+                        else:
+                            seq.status = SequenceStatus.RUNNING
+                            self.running[seq.slot_idx] = seq
                     self._steps_since_prefill = 0
 
             # 2. Decode all running sequences (one token each).
@@ -164,7 +182,8 @@ class Scheduler:
 
                     try:
                         next_tokens = self.runner.decode(
-                            slot_ids, last_tokens, cache_lengths
+                            slot_ids, last_tokens, cache_lengths,
+                            [s.sampling for s in seqs],
                         )
                     except Exception as e:
                         log.exception("decode step failed: %s", e)

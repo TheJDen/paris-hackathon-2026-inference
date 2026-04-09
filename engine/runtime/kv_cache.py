@@ -9,11 +9,11 @@ The big idea is **slot pooling** — pre-allocate one big tensor per layer
 that holds state for *all* concurrent slots, and gather/scatter the active
 batch's rows around each forward pass.
 
-  * Full-attention layers see a `[num_slots, max_seq_len, num_kv_heads, head_dim]`
+  * Full-attention layers see a `[num_slots, num_kv_heads, max_seq_len, head_dim]`
     tensor per layer. Each in-flight sequence owns one row (`slot_idx`); per-token
-    K/V append happens at `(slot_idx, position)`. The `update()` method writes
-    the new K/V into the right slot positions and returns a padded
-    `[B, H, max_kv_seq, D]` view for the attention call.
+    K/V append happens at `(slot_idx, head, position)`. The `update()` method writes
+    the new K/V into the right slot positions and returns a
+    `[B, H, max_kv_seq, D]` view for the attention call via index_select.
   * Linear-attention (Gated DeltaNet) layers read `cache.layers[i].conv_states`
     and `recurrent_states` as direct attributes and mutate them in place via
     fla / causal_conv1d kernels. We give them an **active view** that's
@@ -111,8 +111,9 @@ class _SlotLayerBase:
 class _FullAttentionSlotLayer(_SlotLayerBase):
     """Slot-pool K/V tensors for one full-attention layer.
 
-    Shape `[num_slots, max_seq_len, num_kv_heads, head_dim]`. We allocate
-    once at startup, then write per-slot per-position.
+    Shape `[num_slots, num_kv_heads, max_seq_len, head_dim]` — heads before
+    seq so `index_select(0, slot_ids)[:, :, :max_s, :]` returns `[B, H, max_s, D]`
+    with no permute. We allocate once at startup, then write per-slot per-position.
     """
 
     def __init__(
@@ -124,8 +125,11 @@ class _FullAttentionSlotLayer(_SlotLayerBase):
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
+        # [num_slots, num_kv_heads, max_seq_len, head_dim] — heads before seq
+        # so index_select(0, slot_ids)[:, :, :max_s, :] returns [B, H, max_s, D]
+        # directly without a permute.
         self.k = torch.zeros(
-            num_slots, max_seq_len, num_kv_heads, head_dim,
+            num_slots, num_kv_heads, max_seq_len, head_dim,
             dtype=dtype, device=device,
         )
         self.v = torch.zeros_like(self.k)
@@ -395,14 +399,12 @@ class SlotPoolCache:
 
         Inputs from HF modeling code:
           key_states / value_states: [B, num_kv_heads, L, head_dim]
-          B = batch size of this forward pass (== self.batch.batch_size)
-          L = number of new tokens this row contributes (1 for decode,
-              prompt_len for prefill of one slot at a time)
 
-        We write into the slot-pool tensor at the per-row write_positions,
-        then return (K_full, V_full) of shape
-          [B, num_kv_heads, max(seq_lens), head_dim]
-        with the unused tail zero (the attention mask masks it out).
+        Pool layout is [num_slots, H, max_seq, D] so index_select(0) returns
+        [B, H, max_seq, D] directly — no permute needed on the read path.
+
+        Decode fast path: L=1, loop over H (=2) instead of B (up to 64).
+        Prefill path: variable L, loop over B (called rarely).
         """
         layer = self.layers[layer_idx]
         assert isinstance(layer, _FullAttentionSlotLayer)
@@ -411,24 +413,42 @@ class SlotPoolCache:
         B, H, L, D = key_states.shape
         assert B == batch.batch_size, f"batch mismatch: K has {B}, batch says {batch.batch_size}"
 
-        # Per-row write — vectorize later. The HF (B, H, L, D) layout has
-        # heads in dim 1; we permute to (L, H, D) per row before storing.
+        if not batch.is_prefill:
+            # --- Decode fast path: L=1, each slot emits exactly one token ---
+            # positions_flat[i] = absolute cache position for slot i.
+            positions_flat = batch.kv_seq_lens - 1  # [B]
+            # Loop over H (=2 KV heads) instead of B (up to 64). Each iteration
+            # is one batched scatter: key_states[:, h, 0, :] → [B, D].
+            for h in range(H):
+                layer.k[batch.slot_ids, h, positions_flat] = key_states[:, h, 0, :].to(layer.k.dtype)
+                layer.v[batch.slot_ids, h, positions_flat] = value_states[:, h, 0, :].to(layer.v.dtype)
+            self.slot_lengths[batch.slot_ids] = batch.kv_seq_lens
+            # Read: single index_select + slice → [B, H, max_s, D], no permute.
+            max_s = int(batch.kv_seq_lens.max().item())
+            out_k = layer.k.index_select(0, batch.slot_ids)[:, :, :max_s, :].contiguous()
+            out_v = layer.v.index_select(0, batch.slot_ids)[:, :, :max_s, :].contiguous()
+            return out_k, out_v
+
+        # --- Prefill path: variable L per row, loop over B (called rarely) ---
+        # n_write may be less than L when batch is right-padded: only real
+        # token positions from write_positions are stored.
         for b in range(B):
             slot_id = int(batch.slot_ids[b])
             positions = batch.write_positions[b]
-            layer.k[slot_id, positions, :, :] = key_states[b].permute(1, 0, 2).to(layer.k.dtype)
-            layer.v[slot_id, positions, :, :] = value_states[b].permute(1, 0, 2).to(layer.v.dtype)
+            n_write = positions.shape[0]
+            # Layout [slots, H, max_seq, D]: no permute needed.
+            layer.k[slot_id, :, positions, :] = key_states[b, :, :n_write, :].to(layer.k.dtype)
+            layer.v[slot_id, :, positions, :] = value_states[b, :, :n_write, :].to(layer.v.dtype)
             self.slot_lengths[slot_id] = batch.kv_seq_lens[b]
 
-        # Read step: build a padded [B, H, S, D] view where S = max kv_seq_len.
         max_s = int(batch.kv_seq_lens.max().item())
         out_k = torch.zeros(B, H, max_s, D, dtype=layer.k.dtype, device=layer.k.device)
         out_v = torch.zeros_like(out_k)
         for b in range(B):
             slot_id = int(batch.slot_ids[b])
             seq_len = int(batch.kv_seq_lens[b])
-            out_k[b, :, :seq_len, :] = layer.k[slot_id, :seq_len].permute(1, 0, 2)
-            out_v[b, :, :seq_len, :] = layer.v[slot_id, :seq_len].permute(1, 0, 2)
+            out_k[b, :, :seq_len, :] = layer.k[slot_id, :, :seq_len, :]
+            out_v[b, :, :seq_len, :] = layer.v[slot_id, :, :seq_len, :]
         return out_k, out_v
 
     # --------------------------------------------------------------- linear-attention updates

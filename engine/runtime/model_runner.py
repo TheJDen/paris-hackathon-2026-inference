@@ -28,7 +28,7 @@ from engine.runtime.kv_cache import BatchSlots, SlotPoolCache
 from engine.runtime.profiling import time_region
 
 if TYPE_CHECKING:
-    pass
+    from engine.runtime.sequence import SamplingParams
 
 
 log = logging.getLogger(__name__)
@@ -105,38 +105,67 @@ class ModelRunner:
     # forward
     # ------------------------------------------------------------------ #
 
-    @torch.inference_mode()
-    def prefill(self, slot_id: int, prompt_token_ids: list[int]) -> int:
-        """Prefill one slot with its prompt and return the first sampled token.
+    def prefill(self, slot_id: int, prompt_token_ids: list[int], sampling: "SamplingParams") -> int:
+        """Prefill one slot. Thin wrapper around prefill_batch."""
+        return self.prefill_batch([slot_id], [prompt_token_ids], [sampling])[0]
 
-        Phase 2a v0: prefill one slot at a time. Phase 2b will batch
-        prefills with chunking.
+    @torch.inference_mode()
+    def prefill_batch(
+        self,
+        slot_ids: list[int],
+        prompt_token_ids_list: list[list[int]],
+        samplings: "list[SamplingParams]",
+    ) -> list[int]:
+        """Prefill B slots in one forward pass. Returns first sampled token per slot.
+
+        Sequences are right-padded to the longest prompt in the batch so all
+        rows share the same input length. Only real-token K/V is written to
+        the cache (padding positions are sliced away in cache.update()).
+
+        Note: DeltaNet recurrent state is computed over the padded sequence,
+        meaning pad tokens after the last real token contribute to the final
+        state. For the throughput eval all prompts have the same length so
+        there is no padding and this is a non-issue.
         """
         with time_region("runner.prefill"):
-            L = len(prompt_token_ids)
-            input_ids = torch.tensor(
-                [prompt_token_ids], dtype=torch.long, device=self.device
+            B = len(slot_ids)
+            prompt_lens = [len(p) for p in prompt_token_ids_list]
+            max_len = max(prompt_lens)
+
+            # Right-pad with zeros. Padding token id does not matter because
+            # the attention mask zeros out those positions.
+            padded = [p + [0] * (max_len - len(p)) for p in prompt_token_ids_list]
+            input_ids = torch.tensor(padded, dtype=torch.long, device=self.device)  # [B, max_len]
+
+            # 1 for real tokens, 0 for right-side padding.
+            attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+            for b in range(B):
+                attention_mask[b, : prompt_lens[b]] = 1
+
+            # Shared position ids 0..max_len-1; padding positions get arbitrary
+            # ids (masked by attention_mask, output is discarded).
+            position_ids = (
+                torch.arange(max_len, dtype=torch.long, device=self.device)
+                .unsqueeze(0)
+                .expand(B, -1)
             )
 
-            # Build batch routing: one row, write positions 0..L-1.
-            slot_ids = torch.tensor([slot_id], dtype=torch.int64, device=self.device)
+            slot_ids_t = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
             write_positions = [
-                torch.arange(L, dtype=torch.int64, device=self.device)
+                torch.arange(prompt_lens[b], dtype=torch.int64, device=self.device)
+                for b in range(B)
             ]
-            query_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
+            query_lens = torch.tensor(prompt_lens, dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor(prompt_lens, dtype=torch.int64, device=self.device)
             self.cache.set_batch(
                 BatchSlots(
-                    slot_ids=slot_ids,
+                    slot_ids=slot_ids_t,
                     write_positions=write_positions,
                     query_lens=query_lens,
                     kv_seq_lens=kv_seq_lens,
                     is_prefill=True,
                 )
             )
-
-            position_ids = torch.arange(L, dtype=torch.long, device=self.device).unsqueeze(0)
-            attention_mask = torch.ones(1, L, dtype=torch.long, device=self.device)
 
             with time_region("runner.prefill.model_forward"):
                 outputs = self.inner_model(
@@ -146,18 +175,24 @@ class ModelRunner:
                     past_key_values=self.cache,
                     use_cache=True,
                 )
-            self.cache.commit_batch()  # scatter linear-attn views back to pool
+            self.cache.commit_batch()
 
-            hidden_states = outputs.last_hidden_state  # [1, L, hidden]
-            # We only need the last position's logits to sample the first output token.
+            hidden_states = outputs.last_hidden_state  # [B, max_len, hidden]
+
             with time_region("runner.prefill.lm_head"):
-                last_hidden = hidden_states[:, -1:, :]
-                logits = self.lm_head(last_hidden)  # [1, 1, vocab]
+                # Gather the hidden state at the last REAL token of each row.
+                last_pos = torch.tensor(
+                    [l - 1 for l in prompt_lens], dtype=torch.long, device=self.device
+                )
+                last_hidden = hidden_states[
+                    torch.arange(B, device=self.device), last_pos
+                ]  # [B, hidden]
+                logits = self.lm_head(last_hidden)  # [B, vocab]
 
             with time_region("runner.prefill.sample"):
-                next_token_id = int(self._sample_greedy(logits[:, -1, :]).item())
+                next_tokens = self._sample(logits, samplings)  # [B]
 
-            return next_token_id
+            return [int(t.item()) for t in next_tokens]
 
     @torch.inference_mode()
     def decode(
@@ -165,6 +200,7 @@ class ModelRunner:
         slot_ids: list[int],
         last_tokens: list[int],
         cache_lengths: list[int],
+        samplings: "list[SamplingParams]",
     ) -> list[int]:
         """Run one decode step for B slots, return next-token id per slot.
 
@@ -203,11 +239,11 @@ class ModelRunner:
                 [[cache_lengths[i]] for i in range(B)],
                 dtype=torch.long, device=self.device,
             )
-            # attention_mask: padded to max kv_seq_len, mask out empty positions
+            # attention_mask: 1 where position < kv_seq_len, 0 elsewhere.
+            # Vectorized: broadcast [1, max_s] < [B, 1] → [B, max_s], no loop.
             max_s = int(kv_seq_lens.max().item())
-            attention_mask = torch.zeros(B, max_s, dtype=torch.long, device=self.device)
-            for b in range(B):
-                attention_mask[b, : cache_lengths[b] + 1] = 1
+            positions = torch.arange(max_s, dtype=torch.long, device=self.device).unsqueeze(0)
+            attention_mask = (positions < kv_seq_lens.unsqueeze(1)).long()
 
             with time_region("runner.decode.model_forward"):
                 outputs = self.inner_model(
@@ -224,16 +260,60 @@ class ModelRunner:
                 logits = self.lm_head(hidden_states[:, -1, :])  # [B, vocab]
 
             with time_region("runner.decode.sample"):
-                next_tokens = self._sample_greedy(logits)  # [B]
+                next_tokens = self._sample(logits, samplings)  # [B]
             return [int(t.item()) for t in next_tokens]
 
     # ------------------------------------------------------------------ #
-    # sampling — greedy only for v0; temp/top_p come next
+    # sampling
     # ------------------------------------------------------------------ #
 
-    def _sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
-        """Argmax over the vocab dimension. Returns a 1-D int64 tensor."""
-        return torch.argmax(logits, dim=-1)
+    def _sample(self, logits: torch.Tensor, samplings: "list[SamplingParams]") -> torch.Tensor:
+        """Per-row temperature + top-p sampling. Returns a 1-D int64 tensor [B].
+
+        Rows with temperature <= 0 get greedy (argmax). Mixed greedy/sampled
+        batches are handled: greedy rows are argmax'd at the end, overriding
+        the multinomial result.
+        """
+        B = logits.shape[0]
+
+        # Fast path: entire batch is greedy.
+        if all(s.greedy for s in samplings):
+            return torch.argmax(logits, dim=-1)
+
+        temperatures = [s.temperature for s in samplings]
+        top_ps = [s.top_p for s in samplings]
+        greedy_mask = torch.tensor(
+            [s.greedy for s in samplings], dtype=torch.bool, device=logits.device
+        )
+
+        # Scale logits by temperature; use 1.0 for greedy rows to avoid div-by-zero.
+        temps = torch.tensor(
+            [1.0 if s.greedy else s.temperature for s in samplings],
+            dtype=logits.dtype, device=logits.device,
+        ).unsqueeze(1)  # [B, 1]
+        scaled = logits / temps  # [B, vocab]
+
+        probs = torch.softmax(scaled, dim=-1)  # [B, vocab]
+
+        # Top-p (nucleus) filtering — vectorised over the batch.
+        if any(p < 1.0 for p in top_ps):
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            # Remove tokens where all prior tokens already cover top_p.
+            top_p_t = torch.tensor(top_ps, dtype=probs.dtype, device=logits.device).unsqueeze(1)
+            to_remove = (cumulative - sorted_probs) > top_p_t
+            sorted_probs = sorted_probs.masked_fill(to_remove, 0.0)
+            # Scatter filtered probs back to vocabulary order.
+            probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
+
+        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+
+        # Override greedy rows with argmax.
+        if greedy_mask.any():
+            greedy_tokens = torch.argmax(logits, dim=-1)
+            sampled = torch.where(greedy_mask, greedy_tokens, sampled)
+
+        return sampled
 
     # ------------------------------------------------------------------ #
     # diagnostics

@@ -171,6 +171,7 @@ class Engine:
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
                 max_decode_batch=self.max_batch,
+                max_prefill_batch=self.max_batch,
             ),
         )
 
