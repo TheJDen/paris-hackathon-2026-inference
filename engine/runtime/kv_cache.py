@@ -419,6 +419,14 @@ class SlotPoolCache:
         # repeat each slot_id once per position.
         slot_ids_long = batch.slot_ids.long()  # [B]
         write_pos_list = batch.write_positions  # list of B int64 tensors
+        # Defensive: skip the row write if there's nothing to write (B==0 or
+        # all rows have empty write_positions). Returning early lets the read
+        # path still build the read view from the existing pool state.
+        if B == 0 or not write_pos_list or all(p.numel() == 0 for p in write_pos_list):
+            max_s = int(batch.kv_seq_lens.max().item()) if batch.kv_seq_lens.numel() else 0
+            out_k = torch.zeros(B, H, max_s, D, dtype=layer.k.dtype, device=layer.k.device)
+            out_v = torch.zeros_like(out_k)
+            return out_k, out_v
         # Lengths per row: tensor [B] of ints (each == L in uniform case).
         pos_lens = torch.tensor(
             [p.shape[0] for p in write_pos_list],
