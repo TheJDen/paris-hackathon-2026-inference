@@ -334,6 +334,18 @@ class DecodeGraphCache:
         #
         # The outer decode() method is decorated @torch.inference_mode() but
         # torch.cuda.graph() internally disables inference mode during capture.
+        #
+        # RNG STATE GUARD: torch.cuda.graph() saves the default CUDA generator's
+        # RNG state at entry and registers it for "graph mode".  After the
+        # capture context exits, the generator is restored — but PyTorch leaves
+        # a flag that causes any subsequent offset increment OUTSIDE a graph
+        # (e.g. torch.multinomial during prefill) to raise:
+        #   "Offset increment outside graph capture encountered unexpectedly."
+        # We explicitly snapshot and restore the default generator's state
+        # around the entire capture block so it is never permanently put into
+        # graph mode from the perspective of eager code running after this call.
+        _saved_rng_state = torch.cuda.get_rng_state(device)
+
         g = torch.cuda.CUDAGraph()
         with torch.no_grad():
             # Run one more set_batch/commit_batch outside the capture so that
@@ -353,6 +365,11 @@ class DecodeGraphCache:
                 hidden_states = outputs.last_hidden_state   # [bucket, 1, hidden]
                 buf_logits = self.lm_head(hidden_states[:, -1, :])  # [bucket, vocab]
             self.cache.commit_batch()
+
+        # Restore the default CUDA generator state so it is not permanently
+        # left in "graph mode" after capture.  Eager callers (e.g. _sample's
+        # torch.multinomial) must be able to increment the RNG offset freely.
+        torch.cuda.set_rng_state(_saved_rng_state, device)
 
         torch.cuda.synchronize(device)
         log.info("CUDA graph capture complete: bucket=%d", bucket)

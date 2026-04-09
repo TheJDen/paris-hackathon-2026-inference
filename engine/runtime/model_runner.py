@@ -30,6 +30,7 @@ from engine.runtime.sequence import SamplingParams
 
 if TYPE_CHECKING:
     from engine.runtime.cuda_graphs import DecodeGraphCache
+    from engine.runtime.compile_helpers import warmup_compiled
 
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class ModelRunner:
         num_slots: int,
         max_seq_len: int,
         enable_cuda_graphs: bool = True,
+        compile: bool = True,
     ) -> None:
         self.hf_model = hf_model
         self.text_config = text_config
@@ -67,16 +69,71 @@ class ModelRunner:
         self.cache = self._build_cache()
         log.info("model runner cache: %s", self.cache)
 
+        # torch.compile — wrap inner_model with Inductor.
+        # Must happen BEFORE CUDA graph init (reduce-overhead mode uses
+        # CUDA graphs internally; if both compile AND DecodeGraphCache are
+        # active they will conflict).  When compile=True we therefore force
+        # enable_cuda_graphs=False.
+        self._compile_enabled = compile and device.type == "cuda"
+        if self._compile_enabled:
+            if enable_cuda_graphs:
+                log.info(
+                    "model runner: torch.compile=True overrides enable_cuda_graphs "
+                    "(reduce-overhead mode owns CUDA graphs; DecodeGraphCache disabled)"
+                )
+            enable_cuda_graphs = False  # prevent double-graph conflict
+            self._apply_compile()
+
         # CUDA graph cache for the decode hot path (lazy init on first use).
         # Set to None when CUDA graphs are disabled (CPU device, stub mode,
-        # or --no-cuda-graphs flag).
+        # --no-cuda-graphs flag, or torch.compile=True above).
         self.decode_graphs: DecodeGraphCache | None = None
         if enable_cuda_graphs and device.type == "cuda":
             self._init_decode_graphs()
 
+        # Dedicated CUDA RNG generator for the sampler.  Using a separate
+        # generator prevents the default CUDA generator from being put into
+        # "graph mode" by CUDA graph capture (which saves/restores the default
+        # generator's RNG state and registers it for capture, causing
+        # torch.multinomial to raise "Offset increment outside graph capture"
+        # during prefill — before any graph has been replayed).
+        self._sampler_generator: torch.Generator | None = None
+        if device.type == "cuda":
+            self._sampler_generator = torch.Generator(device=device)
+            self._sampler_generator.manual_seed(0)
+
+        # Warmup: fire the compile before the first real request.
+        if self._compile_enabled:
+            self._warmup_compile()
+
     # ------------------------------------------------------------------ #
     # construction
     # ------------------------------------------------------------------ #
+
+    def _apply_compile(self) -> None:
+        """Apply dynamo disables + torch.compile to self.inner_model."""
+        from engine.runtime.compile_helpers import apply_dynamo_disables, compile_model
+
+        log.info("model runner: applying dynamo disables (cache + linear-attn)")
+        apply_dynamo_disables(self.hf_model)
+
+        log.info("model runner: wrapping inner_model with torch.compile")
+        self.inner_model = compile_model(
+            self.hf_model,
+            mode="reduce-overhead",
+            dynamic=True,
+        )
+        log.info("model runner: torch.compile wrapper installed (lazy — fires on first forward)")
+
+    def _warmup_compile(self) -> None:
+        """Fire the compile with dummy tensors before the first real request."""
+        from engine.runtime.compile_helpers import warmup_compiled
+
+        warmup_compiled(
+            self,
+            max_batch=min(8, self.num_slots),
+            max_seq=min(2048, self.max_seq_len),
+        )
 
     def _init_decode_graphs(self) -> None:
         """Instantiate the DecodeGraphCache (lazy; graphs captured on demand)."""
@@ -142,11 +199,27 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
 
     @torch.inference_mode()
-    def prefill(self, slot_id: int, prompt_token_ids: list[int], sampling: SamplingParams | None = None) -> int:
+    def prefill(
+        self,
+        slot_id: int,
+        prompt_token_ids: list[int],
+        sampling: SamplingParams | None = None,
+        prefix_offset: int = 0,
+    ) -> int:
         """Prefill one slot with its prompt and return the first sampled token.
 
         Phase 2a v0: prefill one slot at a time. Phase 2b will batch
         prefills with chunking.
+
+        Args:
+            prefix_offset: if > 0, the slot already has ``prefix_offset`` tokens
+                           cached (copied from the shared-prefix reserved slot).
+                           ``prompt_token_ids`` should contain ONLY the suffix
+                           tokens (prompt[prefix_offset:]).  Write positions and
+                           position_ids are shifted by ``prefix_offset``
+                           accordingly.  ``kv_seq_lens`` is set to
+                           ``prefix_offset + L`` so attention sees the full
+                           context.
         """
         with time_region("runner.prefill"):
             L = len(prompt_token_ids)
@@ -154,13 +227,16 @@ class ModelRunner:
                 [prompt_token_ids], dtype=torch.long, device=self.device
             )
 
-            # Build batch routing: one row, write positions 0..L-1.
+            # Build batch routing: one row.
+            # When prefix_offset > 0 the slot already has the first
+            # prefix_offset positions cached; we write suffix tokens at
+            # positions [prefix_offset, prefix_offset + L).
             slot_ids = torch.tensor([slot_id], dtype=torch.int64, device=self.device)
             write_positions = [
-                torch.arange(L, dtype=torch.int64, device=self.device)
+                torch.arange(prefix_offset, prefix_offset + L, dtype=torch.int64, device=self.device)
             ]
             query_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor([prefix_offset + L], dtype=torch.int64, device=self.device)
             self.cache.set_batch(
                 BatchSlots(
                     slot_ids=slot_ids,
@@ -171,8 +247,13 @@ class ModelRunner:
                 )
             )
 
-            position_ids = torch.arange(L, dtype=torch.long, device=self.device).unsqueeze(0)
-            attention_mask = torch.ones(1, L, dtype=torch.long, device=self.device)
+            position_ids = torch.arange(
+                prefix_offset, prefix_offset + L, dtype=torch.long, device=self.device
+            ).unsqueeze(0)
+            # Attention mask must cover the full context (prefix + suffix).
+            # Build a 1 × (prefix_offset + L) mask of ones.
+            full_len = prefix_offset + L
+            attention_mask = torch.ones(1, full_len, dtype=torch.long, device=self.device)
 
             with time_region("runner.prefill.model_forward"):
                 outputs = self.inner_model(
@@ -209,6 +290,7 @@ class ModelRunner:
         slot_ids: list[int],
         prompt_token_ids_list: list[list[int]],
         samplings: list,
+        prefix_offsets: list[int] | None = None,
     ) -> list[int]:
         """Prefill B slots in one padded forward pass and return first tokens.
 
@@ -218,21 +300,43 @@ class ModelRunner:
         for real tokens.  The cache update() slices each row to its real
         length so no garbage K/V from pad positions is written to the slot pool.
 
+        Args:
+            prefix_offsets: optional list of per-row prefix offsets.  When
+                ``prefix_offsets[b] > 0``, row b's slot already has
+                ``prefix_offsets[b]`` tokens cached (copied from the shared
+                prefix reserved slot).  ``prompt_token_ids_list[b]`` must
+                contain ONLY the suffix tokens (original_prompt[offset:]).
+                Write positions and position_ids for that row are shifted by
+                the offset; kv_seq_lens accounts for the full context length.
+                If all offsets are 0 (or prefix_offsets is None), behavior is
+                identical to the original implementation.
+
         Returns a list of B first-token ids, one per sequence.
         """
         with time_region("runner.prefill_batch"):
             B = len(slot_ids)
+            if prefix_offsets is None:
+                prefix_offsets = [0] * B
 
             # Fast path: single sequence — delegate to the single-slot path
             # to avoid any overhead from the batched code path.
             if B == 1:
-                return [self.prefill(slot_ids[0], prompt_token_ids_list[0], samplings[0])]
+                return [self.prefill(
+                    slot_ids[0],
+                    prompt_token_ids_list[0],
+                    samplings[0],
+                    prefix_offset=prefix_offsets[0],
+                )]
 
+            # ``real_lens[b]`` = number of suffix tokens for row b.
+            # ``full_lens[b]`` = prefix_offset[b] + real_lens[b] (total context).
             real_lens = [len(p) for p in prompt_token_ids_list]
-            max_L = max(real_lens)
+            offsets = prefix_offsets  # alias for clarity
+            full_lens = [offsets[b] + real_lens[b] for b in range(B)]
+            max_L = max(real_lens)          # maximum suffix length (for input tensor)
+            max_full = max(full_lens)       # maximum total context (for attention mask)
 
-            # Pick a pad token id. Use eos_token_id if the model exposes one
-            # via inner_model.config; fall back to 0. The mask gates it.
+            # Pick a pad token id.
             pad_token_id = 0
             config = getattr(self.inner_model, "config", None)
             if config is not None:
@@ -240,7 +344,7 @@ class ModelRunner:
                 if eos is not None:
                     pad_token_id = eos if isinstance(eos, int) else eos[0]
 
-            # Build [B, max_L] input_ids with right-padding.
+            # Build [B, max_L] input_ids with right-padding (suffix tokens only).
             input_ids_np = torch.full(
                 (B, max_L), fill_value=pad_token_id, dtype=torch.long, device=self.device
             )
@@ -250,25 +354,35 @@ class ModelRunner:
                 )
             input_ids = input_ids_np  # [B, max_L]
 
-            # attention_mask: 1 for real tokens, 0 for pad.
-            attention_mask = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
+            # attention_mask: [B, max_full].
+            # For prefix-cached rows, positions 0..offset-1 are already in the
+            # cache and must appear as attended tokens in the mask; real suffix
+            # positions offset..full_len-1 are also 1; pad is 0.
+            attention_mask = torch.zeros(B, max_full, dtype=torch.long, device=self.device)
             for b in range(B):
-                attention_mask[b, : real_lens[b]] = 1
+                attention_mask[b, : full_lens[b]] = 1
 
-            # position_ids: [B, max_L].  Real positions are correct; pad
-            # positions get an out-of-range value but the mask gates them.
-            position_ids = torch.arange(max_L, dtype=torch.long, device=self.device).unsqueeze(0).expand(B, -1)
+            # position_ids: [B, max_L] — suffix positions only (the model sees
+            # only the suffix input_ids, but at the right absolute positions).
+            # Row b: positions offsets[b], offsets[b]+1, ..., offsets[b]+real_lens[b]-1
+            # Pad positions get a value == full_lens[b] (out of range, gated by mask).
+            position_ids = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
+            for b in range(B):
+                position_ids[b, : real_lens[b]] = torch.arange(
+                    offsets[b], full_lens[b], dtype=torch.long, device=self.device
+                )
+                if real_lens[b] < max_L:
+                    position_ids[b, real_lens[b] :] = full_lens[b]
 
-            # BatchSlots: per-row write_positions carry REAL lengths only.
-            # kv_cache.update() will slice key_states[b, :, :real_len_b, :]
-            # before writing, so pad positions never touch the cache pool.
+            # BatchSlots: per-row write_positions are the suffix positions in
+            # the slot pool (offset..full_len-1), not 0..real_len-1.
             slot_ids_t = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
             write_positions = [
-                torch.arange(real_lens[b], dtype=torch.int64, device=self.device)
+                torch.arange(offsets[b], full_lens[b], dtype=torch.int64, device=self.device)
                 for b in range(B)
             ]
             query_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor(full_lens, dtype=torch.int64, device=self.device)
             self.cache.set_batch(
                 BatchSlots(
                     slot_ids=slot_ids_t,
@@ -290,10 +404,9 @@ class ModelRunner:
             self.cache.commit_batch()
 
             # hidden_states: [B, max_L, hidden].
-            # Extract last-real-position hidden state per row.
+            # Extract last-real-position hidden state per row (index real_lens[b]-1).
             hidden_states = outputs.last_hidden_state  # [B, max_L, hidden]
             hidden_dim = hidden_states.shape[-1]
-            # Index of the last real token per row: real_lens[b] - 1.
             last_real_idx = torch.tensor(
                 [l - 1 for l in real_lens], dtype=torch.long, device=self.device
             )  # [B]
@@ -504,7 +617,9 @@ class ModelRunner:
 
         # Sample from the filtered distribution.
         probs = torch.softmax(filtered_logits, dim=-1)  # [B, vocab]
-        stochastic_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+        stochastic_tokens = torch.multinomial(
+            probs, num_samples=1, generator=self._sampler_generator
+        ).squeeze(1)  # [B]
 
         # Greedy tokens (argmax on the original logits, not scaled).
         greedy_tokens = torch.argmax(logits_f, dim=-1)  # [B]

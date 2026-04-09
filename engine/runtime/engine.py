@@ -45,6 +45,7 @@ from engine.runtime.profiling import (
     torch_profiler_enabled,
     torch_profiler_tag,
 )
+from engine.runtime.prefix_cache import PrefixCache
 from engine.runtime.scheduler import Scheduler, SchedulerConfig
 from engine.runtime.sequence import (
     GenerationResult,
@@ -86,6 +87,7 @@ class Engine:
         profile_torch_min_batch_size: int = 1,
         profile_torch_tag: str = "run",
         enable_cuda_graphs: bool = True,
+        torch_compile: bool = True,
     ) -> None:
         self.model_name = model_name
         self.stub = stub
@@ -105,10 +107,12 @@ class Engine:
         self._profile_done = False
         self._batch_index = 0  # incremented per decode step
         self._enable_cuda_graphs = bool(enable_cuda_graphs)
+        self._torch_compile = bool(torch_compile)
 
         self.tokenizer: ChatTokenizer | None = None
         self.runner = None
         self.scheduler: Scheduler | None = None
+        self.prefix_cache: PrefixCache | None = None
 
         # Single-thread executor so torch.profiler thread-affinity holds.
         self._gen_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -165,6 +169,7 @@ class Engine:
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
                 enable_cuda_graphs=self._enable_cuda_graphs,
+                compile=self._torch_compile,
             )
             log.info(
                 "model runner ready: cache_mem=%.2f GB", self.runner.cache_memory_gb()
@@ -179,6 +184,58 @@ class Engine:
                 max_prefill_batch=self.max_prefill_batch,
             ),
         )
+
+        # Prefix cache: reserve the last slot for the shared chat-template
+        # prefix so it is never handed out to normal requests.
+        self.prefix_cache = PrefixCache(
+            cache=self.runner.cache,
+            num_slots=self.max_batch,
+        )
+        # Remove the reserved slot from the scheduler's free pool so it is
+        # never assigned to a regular request.
+        reserved = self.prefix_cache.RESERVED_SLOT
+        if reserved in self.scheduler.free_slots:
+            self.scheduler.free_slots.remove(reserved)
+            log.info("prefix_cache: removed slot %d from scheduler free pool", reserved)
+
+        # Warm up: one-time prefill of the prefix into the reserved slot.
+        # We need the tokenizer's raw encode function (no chat template).
+        assert self._loaded is not None
+
+        def _raw_encode(messages_or_text, /) -> list[int]:
+            """Encode either a messages list (via chat template) or a plain string."""
+            if isinstance(messages_or_text, str):
+                return self._loaded.tokenizer.encode(
+                    messages_or_text, add_special_tokens=False
+                )
+            # messages list → apply chat template, then encode
+            from engine.tokenizer.chat_template import ChatTokenizer as _CT
+            # Re-use the existing tokenizer wrapper's tok
+            text = self.tokenizer.tok.apply_chat_template(
+                messages_or_text,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            ) if hasattr(self.tokenizer.tok, "apply_chat_template") else ""
+            return self._loaded.tokenizer.encode(text, add_special_tokens=False)
+
+        try:
+            self.prefix_cache.warm_up(
+                runner=self.runner,
+                tokenizer_encode_fn=_raw_encode,
+            )
+        except Exception as exc:
+            log.exception("prefix_cache warm_up failed (%s); continuing without it", exc)
+            self.prefix_cache = None
+
+        # Pass the prefix cache reference to the scheduler so admit can use it.
+        if self.prefix_cache is not None:
+            self.scheduler.prefix_cache = self.prefix_cache
+            log.info(
+                "prefix_cache: ready — prefix_len=%d tokens, reserved_slot=%d",
+                self.prefix_cache.prefix_len,
+                self.prefix_cache.RESERVED_SLOT,
+            )
 
     async def start(self) -> None:
         """Spawn the dedicated engine thread + drain loop. Idempotent."""

@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass
 
 from engine.runtime.model_runner import ModelRunner
+from engine.runtime.prefix_cache import PrefixCache
 from engine.runtime.profiling import time_region
 from engine.runtime.sequence import (
     GenerationResult,
@@ -84,6 +85,13 @@ class Scheduler:
         self._step_count = 0
         self._steps_since_prefill = 0
 
+        # Prefix cache — set by Engine after warm_up().  None means disabled.
+        self.prefix_cache: PrefixCache | None = None
+
+        # Telemetry counters.
+        self._prefix_hits: int = 0
+        self._prefix_misses: int = 0
+
     # ------------------------------------------------------------------ #
     # public API
     # ------------------------------------------------------------------ #
@@ -122,26 +130,83 @@ class Scheduler:
 
             if should_prefill:
                 with time_region("scheduler.admit_prefill"):
-                    # Admit up to max_prefill_batch sequences in one step.
-                    # This amortises scheduler overhead over the whole batch
-                    # and fills the decode pool faster at high concurrency.
+                    # Admit up to max_prefill_batch sequences in one step,
+                    # all from the same length bucket to minimise padding waste.
+                    #
+                    # Bucket scheme: ceil-to-next-multiple-of-128.
+                    #   bucket(L) = ((L + 127) // 128) * 128
+                    # Within one prefill call all sequences share a bucket, so
+                    # padding waste is at most 127 tokens per sequence (< 12%
+                    # for 1024-token prompts) vs unbounded under pure FIFO.
+                    #
+                    # Fairness: we pick the bucket that contains the OLDEST
+                    # waiting sequence (by enqueued_at). No request starves
+                    # because the longest-waiting sequence always determines
+                    # which bucket fires next.
+                    def _bucket(seq: Sequence) -> int:
+                        return ((seq.prompt_len + 127) // 128) * 128
+
+                    # Snapshot the waiting list (cheap — at most a few hundred
+                    # entries in practice; the FIFO order is preserved below).
+                    waiting_list = list(self.waiting)
+
+                    # Find the oldest sequence and pin the target bucket.
+                    oldest = min(waiting_list, key=lambda s: s.enqueued_at)
+                    target_bucket = _bucket(oldest)
+
+                    # Collect up to max_prefill_batch sequences that fall in
+                    # the target bucket, preserving their relative FIFO order.
+                    # Sequences that don't fit stay in waiting unchanged.
                     batch_seqs: list[Sequence] = []
+                    remaining: list[Sequence] = []
+                    max_admit = min(self.config.max_prefill_batch, len(self.free_slots))
+                    for seq in waiting_list:
+                        if (
+                            len(batch_seqs) < max_admit
+                            and _bucket(seq) == target_bucket
+                        ):
+                            batch_seqs.append(seq)
+                        else:
+                            remaining.append(seq)
+
+                    # Rebuild the waiting deque from whatever we didn't admit.
+                    self.waiting = collections.deque(remaining)
+
                     prefill_t0 = time.perf_counter()
-                    for _ in range(self.config.max_prefill_batch):
-                        if not self.waiting or not self.free_slots:
-                            break
-                        seq = self.waiting.popleft()
+                    for seq in batch_seqs:
                         slot_id = self.free_slots.popleft()
                         seq.slot_idx = slot_id
                         seq.status = SequenceStatus.PREFILLING
                         seq.prefill_started_at = prefill_t0
-                        batch_seqs.append(seq)
+
+                    # --- Prefix caching: copy shared prefix K/V into each slot ---
+                    # For sequences whose prompt starts with the cached prefix,
+                    # copy prefix K/V from the reserved slot into the new slot,
+                    # then pass only the suffix tokens to prefill_batch with the
+                    # appropriate position offset.
+                    prefix_offsets: list[int] = [0] * len(batch_seqs)
+                    suffix_token_ids: list[list[int]] = [s.prompt_token_ids for s in batch_seqs]
+                    if self.prefix_cache is not None and self.prefix_cache.ready:
+                        pc = self.prefix_cache
+                        for i, seq in enumerate(batch_seqs):
+                            if pc.matches(seq.prompt_token_ids):
+                                pc.apply_to_slot(seq.slot_idx)
+                                prefix_offsets[i] = pc.prefix_len
+                                suffix_token_ids[i] = seq.prompt_token_ids[pc.prefix_len:]
+                                self._prefix_hits += 1
+                                log.debug(
+                                    "prefix_cache hit: seq=%s slot=%d prefix_len=%d suffix_len=%d",
+                                    seq.request_id, seq.slot_idx, pc.prefix_len, len(suffix_token_ids[i]),
+                                )
+                            else:
+                                self._prefix_misses += 1
 
                     try:
                         first_tokens = self.runner.prefill_batch(
                             [s.slot_idx for s in batch_seqs],
-                            [s.prompt_token_ids for s in batch_seqs],
+                            suffix_token_ids,
                             [s.sampling for s in batch_seqs],
+                            prefix_offsets=prefix_offsets,
                         )
                     except Exception as e:
                         log.exception(
