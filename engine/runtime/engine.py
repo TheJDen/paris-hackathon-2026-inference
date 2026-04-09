@@ -91,6 +91,7 @@ class Engine:
         attn_impl: str = "sdpa",
         batch_window_ms: float = 5.0,
         profile_torch_after_batches: int = 0,
+        profile_torch_min_batch_size: int = 1,
         profile_torch_tag: str = "run",
     ) -> None:
         self.model_name = model_name
@@ -103,9 +104,12 @@ class Engine:
         self.batch_window_s = batch_window_ms / 1000.0
 
         # One-shot torch.profiler capture: skip the first N batches as
-        # warmup, then capture batch N+1 inside torch.profiler.profile,
-        # export, and disable. Set to 0 to disable; >0 enables.
+        # warmup, then capture the FIRST batch after that whose size is at
+        # least `profile_torch_min_batch_size`. The min-size predicate
+        # avoids accidentally capturing a level's 2-request warmup batch
+        # instead of a meaningful steady-state main batch.
         self._profile_after_batches = int(profile_torch_after_batches)
+        self._profile_min_batch_size = max(1, int(profile_torch_min_batch_size))
         self._profile_tag = str(profile_torch_tag)
         self._profile_done = False
         self._batch_index = 0
@@ -388,6 +392,7 @@ class Engine:
             self._profile_after_batches > 0
             and not self._profile_done
             and self._batch_index > self._profile_after_batches
+            and int(input_ids.shape[0]) >= self._profile_min_batch_size
         ):
             return self._generate_with_torch_profile(
                 input_ids, attention_mask, gen_kwargs, loaded

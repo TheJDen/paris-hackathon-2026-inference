@@ -64,8 +64,16 @@ def parse_args() -> argparse.Namespace:
         "--profile-torch-after-batches",
         type=int,
         default=0,
-        help="capture a one-shot torch profile of batch N+1 after N warmup batches "
-        "(0 disables). Output lands in profiles/torch_<tag>_<ts>.{json.gz,txt}",
+        help="capture a one-shot torch profile of the FIRST batch after N warmup "
+        "batches whose size meets --profile-torch-min-batch-size (0 disables). "
+        "Output lands in profiles/torch_<tag>_b<bs>_n<n>_<sha>_<ts>.{json.gz,txt,summary.json}",
+    )
+    p.add_argument(
+        "--profile-torch-min-batch-size",
+        type=int,
+        default=1,
+        help="minimum batch size for the one-shot profile capture; the engine "
+        "skips smaller batches (e.g. per-level warmups) and waits for the next one",
     )
     p.add_argument("--profile-tag", default="run", help="tag for profile artifact names")
     return p.parse_args()
@@ -92,6 +100,7 @@ def main() -> None:
         attn_impl=args.attn_impl,
         batch_window_ms=args.batch_window_ms,
         profile_torch_after_batches=args.profile_torch_after_batches,
+        profile_torch_min_batch_size=args.profile_torch_min_batch_size,
         profile_torch_tag=args.profile_tag,
     )
 

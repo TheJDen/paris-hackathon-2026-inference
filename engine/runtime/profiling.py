@@ -260,11 +260,19 @@ def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tupl
         chrome_path = ""
         print(f"[profile] chrome trace export failed: {e}")
 
-    # Sorted summary table — what humans read first
-    table = prof.key_averages().table(
-        sort_by="self_cuda_time_total",
-        row_limit=30,
-    )
+    # Sorted summary table — what humans read first.
+    # torch >= 2.11 prefers `self_device_time_total`; fall back to the old
+    # name on older versions.
+    try:
+        table = prof.key_averages().table(
+            sort_by="self_device_time_total",
+            row_limit=30,
+        )
+    except Exception:
+        table = prof.key_averages().table(
+            sort_by="self_cuda_time_total",
+            row_limit=30,
+        )
     with open(summary_path, "w") as f:
         f.write(f"# torch.profiler summary\n")
         f.write(f"# tag: {tag}\n")
@@ -278,14 +286,23 @@ def export_torch_profile(prof, tag: str, extra_meta: dict | None = None) -> tupl
         f.write("# sort: self_cuda_time_total\n\n")
         f.write(table)
 
-    # Structured top-N for STATUS.md
+    # Structured top-N for STATUS.md.
+    # torch >= 2.11 renamed `self_cuda_time_total` -> `self_device_time_total`
+    # to be backend-agnostic. Read whichever is present.
     top_kernels: list[dict] = []
     for ev in prof.key_averages():
+        self_cuda = 0.0
+        for attr in ("self_device_time_total", "self_cuda_time_total"):
+            try:
+                v = getattr(ev, attr, 0.0)
+                if v:
+                    self_cuda = float(v)
+                    break
+            except Exception:
+                continue
         try:
-            self_cuda = float(ev.self_cuda_time_total)
             self_cpu = float(ev.self_cpu_time_total)
         except Exception:
-            self_cuda = 0.0
             self_cpu = 0.0
         top_kernels.append({
             "name": str(ev.key),
