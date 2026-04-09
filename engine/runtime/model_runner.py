@@ -438,6 +438,191 @@ class ModelRunner:
             return [int(t.item()) for t in next_tokens]
 
     @torch.inference_mode()
+    def mixed_step(
+        self,
+        decode_slot_ids: list[int],
+        decode_last_tokens: list[int],
+        decode_cache_lengths: list[int],
+        decode_samplings: list[SamplingParams] | None,
+        prefill_slot_ids: list[int],
+        prefill_token_ids_list: list[list[int]],
+        prefill_samplings: list,
+        prefill_offsets: list[int] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """Chunked-prefill-style mixed step: decode rows + prefill rows in ONE forward.
+
+        Decode rows contribute query_len=1 (the just-sampled token).
+        Prefill rows contribute query_len=L_r (their full suffix).
+
+        Layout of the combined batch:
+            rows [0..D)        = decode rows (query_len=1)
+            rows [D..D+P)      = prefill rows (query_len=L_r)
+
+        Ragged kv handling: each row r has an effective kv length:
+            decode row r:  cache_lengths[r] + 1
+            prefill row r: offsets[r] + L_r
+        We pass attention_mask of shape [B, max_full] with 1s on
+        [0..effective_kv_len_r) — exactly as prefill_batch already does.
+        The kv_cache.update() slices each row to its real write positions so
+        no pad K/V pollutes the slot pool.
+
+        Returns:
+            (decode_next_tokens, prefill_first_tokens)
+        """
+        D = len(decode_slot_ids)
+        P = len(prefill_slot_ids)
+        assert D == len(decode_last_tokens) == len(decode_cache_lengths)
+        assert P == len(prefill_token_ids_list) == len(prefill_samplings)
+
+        # Trivial fallbacks so warmup / single-class callers stay cheap.
+        if D == 0 and P == 0:
+            return [], []
+        if P == 0:
+            toks = self.decode(
+                decode_slot_ids, decode_last_tokens, decode_cache_lengths, decode_samplings
+            )
+            return toks, []
+        if D == 0:
+            toks = self.prefill_batch(
+                prefill_slot_ids,
+                prefill_token_ids_list,
+                prefill_samplings,
+                prefix_offsets=prefill_offsets,
+            )
+            return [], toks
+
+        with time_region("runner.mixed_step"):
+            if prefill_offsets is None:
+                prefill_offsets = [0] * P
+
+            # Per-row real query lens (how many new token positions to write).
+            real_lens: list[int] = [1] * D + [len(p) for p in prefill_token_ids_list]
+            # Full kv length per row (for attention mask).
+            full_lens: list[int] = (
+                [decode_cache_lengths[i] + 1 for i in range(D)]
+                + [prefill_offsets[i] + len(prefill_token_ids_list[i]) for i in range(P)]
+            )
+            # Per-row starting write position (absolute slot position where the
+            # new tokens land).
+            start_pos: list[int] = (
+                [decode_cache_lengths[i] for i in range(D)]
+                + [prefill_offsets[i] for i in range(P)]
+            )
+
+            B = D + P
+            max_L = max(real_lens)
+            max_full = max(full_lens)
+
+            # Pad token.
+            pad_token_id = 0
+            config = getattr(self.inner_model, "config", None)
+            if config is not None:
+                eos = getattr(config, "eos_token_id", None)
+                if eos is not None:
+                    pad_token_id = eos if isinstance(eos, int) else eos[0]
+
+            # input_ids: [B, max_L], right-padded.
+            input_ids = torch.full(
+                (B, max_L), fill_value=pad_token_id, dtype=torch.long, device=self.device
+            )
+            for i in range(D):
+                input_ids[i, 0] = decode_last_tokens[i]
+            for j, prompt in enumerate(prefill_token_ids_list):
+                input_ids[D + j, : len(prompt)] = torch.tensor(
+                    prompt, dtype=torch.long, device=self.device
+                )
+
+            # attention_mask: [B, max_full] — 1s for real kv positions (cache
+            # already contains [0..start_pos[r]) and this step writes
+            # [start_pos[r]..full_lens[r])).
+            attention_mask = torch.zeros(B, max_full, dtype=torch.long, device=self.device)
+            for r in range(B):
+                attention_mask[r, : full_lens[r]] = 1
+
+            # position_ids: [B, max_L]. Real positions are arange(start, start+L_r);
+            # pad positions get full_lens[r] (out of range, gated by mask).
+            position_ids = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
+            for r in range(B):
+                L_r = real_lens[r]
+                position_ids[r, :L_r] = torch.arange(
+                    start_pos[r], start_pos[r] + L_r, dtype=torch.long, device=self.device
+                )
+                if L_r < max_L:
+                    position_ids[r, L_r:] = full_lens[r]
+
+            # BatchSlots: per-row write positions, query_lens, kv_seq_lens.
+            all_slot_ids = list(decode_slot_ids) + list(prefill_slot_ids)
+            slot_ids_t = torch.tensor(all_slot_ids, dtype=torch.int64, device=self.device)
+            write_positions = [
+                torch.arange(
+                    start_pos[r], start_pos[r] + real_lens[r],
+                    dtype=torch.int64, device=self.device,
+                )
+                for r in range(B)
+            ]
+            query_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor(full_lens, dtype=torch.int64, device=self.device)
+            # Mixed batch: mark is_prefill=True so the cache path takes the
+            # ragged/variable-length write branch (same path prefill_batch uses).
+            self.cache.set_batch(
+                BatchSlots(
+                    slot_ids=slot_ids_t,
+                    write_positions=write_positions,
+                    query_lens=query_lens,
+                    kv_seq_lens=kv_seq_lens,
+                    is_prefill=True,
+                )
+            )
+
+            with time_region("runner.mixed_step.model_forward"):
+                outputs = self.inner_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=self.cache,
+                    use_cache=True,
+                )
+            self.cache.commit_batch()
+
+            hidden_states = outputs.last_hidden_state  # [B, max_L, hidden]
+            hidden_dim = hidden_states.shape[-1]
+            # Sample the last-real-position per row. For decode rows that's
+            # index 0; for prefill rows that's index L_r-1.
+            last_real_idx = torch.tensor(
+                [real_lens[r] - 1 for r in range(B)], dtype=torch.long, device=self.device
+            )
+            last_hidden = hidden_states.gather(
+                dim=1,
+                index=last_real_idx.view(B, 1, 1).expand(B, 1, hidden_dim),
+            ).squeeze(1)  # [B, hidden]
+
+            with time_region("runner.mixed_step.lm_head"):
+                logits = self.lm_head(last_hidden)  # [B, vocab]
+
+            # Build per-row temps/top_ps for sampling.
+            temps_list: list[float] = []
+            top_ps_list: list[float] = []
+            if decode_samplings is not None:
+                for s in decode_samplings:
+                    temps_list.append(s.temperature if s is not None else 0.0)
+                    top_ps_list.append(s.top_p if s is not None else 1.0)
+            else:
+                temps_list.extend([0.0] * D)
+                top_ps_list.extend([1.0] * D)
+            for s in prefill_samplings:
+                temps_list.append(s.temperature if s is not None else 0.0)
+                top_ps_list.append(s.top_p if s is not None else 1.0)
+
+            temps = torch.tensor(temps_list, dtype=torch.float32, device=self.device)
+            top_ps = torch.tensor(top_ps_list, dtype=torch.float32, device=self.device)
+
+            with time_region("runner.mixed_step.sample"):
+                next_tokens = self._sample(logits, temps, top_ps)  # [B]
+
+            result = [int(t.item()) for t in next_tokens]
+            return result[:D], result[D:]
+
+    @torch.inference_mode()
     def decode(
         self,
         slot_ids: list[int],

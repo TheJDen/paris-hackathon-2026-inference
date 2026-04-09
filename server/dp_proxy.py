@@ -1,14 +1,14 @@
-"""DP=8 reverse proxy for the paris-hackathon-2026-inference engine.
+"""DP=N reverse proxy for the paris-hackathon-2026-inference engine.
 
-Sits in front of 8 independent engine instances (one per GPU) and provides
+Sits in front of N independent engine instances (one per GPU) and provides
 a single OpenAI-compatible endpoint to clients. This is pure process-level
 data-parallelism: zero NCCL, no model surgery, no shared state between the
 backend ranks.
 
 Routing:
-  - POST /v1/chat/completions  — round-robin across healthy backends,
+  - POST /v1/chat/completions  — least-loaded backend (inflight counter),
                                   with automatic failover around down ranks.
-  - GET  /health               — 200 if at least one backend is healthy.
+  - GET  /health               — 200 if ALL backends are healthy; 503 otherwise.
   - GET  /metrics              — aggregated snapshot: throughput counters
                                   summed, latency percentiles from rank-0.
   - GET  /metrics/regions      — region tables from all backends concatenated,
@@ -22,20 +22,19 @@ Failure handling:
 
 Run:
     python -m server.dp_proxy --port 8765 \
-        --backends http://localhost:7001 ... http://localhost:7008
+        --backends http://localhost:9000 ... http://localhost:9004
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import itertools
 import json
 import logging
 import time
 from typing import Sequence
 
-from aiohttp import web, ClientSession, ClientError, ClientTimeout
+from aiohttp import web, ClientSession, ClientError, ClientTimeout, TCPConnector
 
 log = logging.getLogger("dp_proxy")
 
@@ -52,20 +51,21 @@ HEALTH_TIMEOUT_S: float = 5.0
 # Timeout for metrics fetches (should be fast).
 METRICS_TIMEOUT_S: float = 10.0
 
-DEFAULT_BACKENDS: list[str] = [f"http://localhost:{7001 + i}" for i in range(8)]
 DEFAULT_PROXY_PORT: int = 8765
+DEFAULT_BACKENDS: list[str] = [f"http://localhost:{9000 + i}" for i in range(5)]
 
 
 # ---------------------------------------------------------------------------
-# Backend health tracker
+# Backend health + load tracker
 # ---------------------------------------------------------------------------
 
 class BackendState:
-    """Tracks liveness of a single backend URL."""
+    """Tracks liveness and in-flight request count for a single backend URL."""
 
     def __init__(self, url: str) -> None:
         self.url = url.rstrip("/")
         self._down_until: float = 0.0  # epoch-seconds; 0 means healthy
+        self.inflight: int = 0         # active forwarded requests
 
     def is_healthy(self) -> bool:
         return time.monotonic() >= self._down_until
@@ -85,63 +85,86 @@ class BackendState:
 # ---------------------------------------------------------------------------
 
 class DPProxy:
-    """Asyncio single-threaded load balancer over DP=N engine backends."""
+    """Asyncio single-threaded load balancer over DP=N engine backends.
+
+    Uses a least-inflight routing policy among healthy backends to avoid
+    hot-spotting when one rank is temporarily slower (e.g. cache miss burst).
+    """
 
     def __init__(self, backends: list[str], port: int) -> None:
         self.port = port
         self._backends = [BackendState(url) for url in backends]
-        # itertools.cycle gives lock-free round-robin over the list indices.
-        self._rr = itertools.cycle(range(len(self._backends)))
         self._session: ClientSession | None = None
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _next_healthy(self) -> BackendState | None:
-        """Return the next healthy backend in round-robin order, or None."""
-        n = len(self._backends)
-        for _ in range(n):
-            idx = next(self._rr)
-            b = self._backends[idx]
-            if b.is_healthy():
-                return b
-        return None
+    def _next_backend(self) -> BackendState | None:
+        """Return the healthy backend with the fewest in-flight requests.
+
+        Falls back to round-robin among equal-load backends for tie-breaking.
+        Returns None only when all backends are down.
+        """
+        healthy = [b for b in self._backends if b.is_healthy()]
+        if not healthy:
+            return None
+        return min(healthy, key=lambda b: b.inflight)
 
     def _healthy_backends(self) -> list[BackendState]:
         return [b for b in self._backends if b.is_healthy()]
 
-    async def _session_get(self) -> ClientSession:
+    async def _get_session(self) -> ClientSession:
         if self._session is None or self._session.closed:
-            self._session = ClientSession()
+            # Use a shared connection pool: limit_per_host avoids fd exhaustion
+            # at high concurrency, but is generous enough for DP=8.
+            connector = TCPConnector(limit_per_host=256, limit=1024)
+            self._session = ClientSession(connector=connector)
         return self._session
 
     # ------------------------------------------------------------------
     # Route handlers
     # ------------------------------------------------------------------
 
-    async def handle_chat(self, request: web.Request) -> web.Response:
-        """POST /v1/chat/completions — forward to the next healthy backend."""
+    async def handle_chat(self, request: web.Request) -> web.StreamResponse:
+        """POST /v1/chat/completions — forward to the least-loaded healthy backend.
+
+        Handles both streaming (SSE) and non-streaming responses transparently.
+        In-flight counter is incremented before the upstream call and decremented
+        in a finally block so the counter is accurate even on exceptions.
+        """
         body = await request.read()
         headers = {
             k: v for k, v in request.headers.items()
             if k.lower() not in ("host", "content-length", "transfer-encoding")
         }
 
-        timeout = ClientTimeout(total=FORWARD_TIMEOUT_S)
-        session = await self._session_get()
+        # Peek at whether the client wants streaming so we can propagate it.
+        try:
+            payload = json.loads(body)
+            is_streaming = bool(payload.get("stream", False))
+        except Exception:
+            is_streaming = False
 
-        # Try each backend in round-robin order; skip down ones.
+        timeout = ClientTimeout(total=FORWARD_TIMEOUT_S)
+        session = await self._get_session()
+
         n = len(self._backends)
-        attempted = 0
+        attempted_urls: set[str] = set()
         last_err: str = "no backends available"
 
-        while attempted < n:
-            backend = self._next_healthy()
+        while len(attempted_urls) < n:
+            backend = self._next_backend()
             if backend is None:
                 break
-            attempted += 1
+            if backend.url in attempted_urls:
+                # All healthy backends tried; break to avoid infinite loop.
+                break
+            attempted_urls.add(backend.url)
+
             url = f"{backend.url}/v1/chat/completions"
+            backend.inflight += 1
+            rank = self._backends.index(backend)
             try:
                 async with session.post(
                     url,
@@ -150,9 +173,7 @@ class DPProxy:
                     timeout=timeout,
                     allow_redirects=False,
                 ) as resp:
-                    rank = self._backends.index(backend)
                     if resp.status >= 500:
-                        # Treat 5xx as a backend fault; mark down and retry.
                         text = await resp.text()
                         log.warning(
                             "backend %s returned %d: %s", backend.url, resp.status, text[:200]
@@ -160,24 +181,44 @@ class DPProxy:
                         backend.mark_down()
                         last_err = f"backend {backend.url} returned {resp.status}"
                         continue
-                    resp_body = await resp.read()
+
+                    backend.mark_up()
+
+                    # Build response headers to pass through.
                     resp_headers = {
                         k: v for k, v in resp.headers.items()
-                        if k.lower() not in ("content-length", "transfer-encoding", "connection")
+                        if k.lower() not in (
+                            "content-length", "transfer-encoding", "connection"
+                        )
                     }
                     resp_headers["X-DP-Rank"] = str(rank)
-                    backend.mark_up()
-                    return web.Response(
-                        status=resp.status,
-                        body=resp_body,
-                        headers=resp_headers,
-                        content_type=resp.content_type or "application/json",
-                    )
+
+                    if is_streaming:
+                        # Stream SSE chunks back to client without buffering.
+                        stream_resp = web.StreamResponse(
+                            status=resp.status,
+                            headers=resp_headers,
+                        )
+                        await stream_resp.prepare(request)
+                        async for chunk in resp.content.iter_any():
+                            await stream_resp.write(chunk)
+                        await stream_resp.write_eof()
+                        return stream_resp
+                    else:
+                        resp_body = await resp.read()
+                        return web.Response(
+                            status=resp.status,
+                            body=resp_body,
+                            headers=resp_headers,
+                            content_type=resp.content_type or "application/json",
+                        )
             except (ClientError, asyncio.TimeoutError, OSError) as exc:
                 log.warning("backend %s connection error: %s", backend.url, exc)
                 backend.mark_down()
                 last_err = str(exc)
                 continue
+            finally:
+                backend.inflight -= 1
 
         log.error("all backends failed or down; last error: %s", last_err)
         return web.Response(
@@ -187,9 +228,13 @@ class DPProxy:
         )
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        """GET /health — probe all backends, return 200 if any is alive."""
+        """GET /health — probe ALL backends; return 200 only when all are alive.
+
+        Individual backend liveness is updated as a side effect so the routing
+        table stays current between benchmark calls.
+        """
         timeout = ClientTimeout(total=HEALTH_TIMEOUT_S)
-        session = await self._session_get()
+        session = await self._get_session()
 
         async def _check(b: BackendState) -> bool:
             try:
@@ -208,15 +253,25 @@ class DPProxy:
 
         results = await asyncio.gather(*(_check(b) for b in self._backends))
         healthy = sum(results)
-        if healthy > 0:
+        total = len(self._backends)
+
+        if healthy == total:
             return web.Response(
                 status=200,
-                text=json.dumps({"status": "ok", "healthy_backends": healthy, "total_backends": len(self._backends)}),
+                text=json.dumps({
+                    "status": "ok",
+                    "healthy_backends": healthy,
+                    "total_backends": total,
+                }),
                 content_type="application/json",
             )
         return web.Response(
             status=503,
-            text=json.dumps({"status": "degraded", "healthy_backends": 0, "total_backends": len(self._backends)}),
+            text=json.dumps({
+                "status": "degraded",
+                "healthy_backends": healthy,
+                "total_backends": total,
+            }),
             content_type="application/json",
         )
 
@@ -229,10 +284,10 @@ class DPProxy:
           - For latency percentiles (p50/p99) use rank-0's values as a
             representative sample — summing percentiles is statistically
             meaningless and the per-backend values are similar at steady state.
-          - Add a synthetic 'dp_healthy_backends' key.
+          - Add synthetic 'dp_healthy_backends' and per-rank inflight keys.
         """
         timeout = ClientTimeout(total=METRICS_TIMEOUT_S)
-        session = await self._session_get()
+        session = await self._get_session()
 
         async def _fetch(b: BackendState) -> dict | None:
             try:
@@ -274,10 +329,9 @@ class DPProxy:
         }
 
         aggregated: dict = {}
-        # Use rank-0 as the base for non-summable fields (uptime, batch info, latency).
+        # Use rank-0 (first valid) as base for non-summable fields.
         aggregated.update(valid[0])
 
-        # Sum the summable keys.
         for key in SUMMABLE:
             total = 0.0
             for snap in valid:
@@ -286,12 +340,14 @@ class DPProxy:
                     total += float(val)
                 except (TypeError, ValueError):
                     pass
-            # Preserve int vs float as in the original.
             orig = valid[0].get(key, 0)
             aggregated[key] = int(total) if isinstance(orig, int) else round(total, 1)
 
         aggregated["dp_healthy_backends"] = len(valid)
         aggregated["dp_total_backends"] = len(self._backends)
+        aggregated["dp_inflight"] = {
+            str(i): b.inflight for i, b in enumerate(self._backends)
+        }
 
         return web.Response(
             status=200,
@@ -303,7 +359,7 @@ class DPProxy:
         """GET /metrics/regions — concatenate region tables with [rank=N] headers."""
         sort_by = request.rel_url.query.get("sort_by", "total")
         timeout = ClientTimeout(total=METRICS_TIMEOUT_S)
-        session = await self._session_get()
+        session = await self._get_session()
 
         async def _fetch(rank: int, b: BackendState) -> tuple[int, str | None]:
             try:
@@ -372,7 +428,7 @@ class DPProxy:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DP=8 round-robin reverse proxy for paris-hackathon-2026-inference"
+        description="DP=N round-robin reverse proxy for paris-hackathon-2026-inference"
     )
     p.add_argument(
         "--port",
@@ -385,7 +441,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=DEFAULT_BACKENDS,
         metavar="URL",
-        help="backend base URLs (default: http://localhost:7001..7008)",
+        help="backend base URLs (default: http://localhost:9000..9004)",
     )
     return p.parse_args()
 

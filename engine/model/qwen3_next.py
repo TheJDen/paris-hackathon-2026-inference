@@ -99,6 +99,19 @@ def load_model(
     """
     import transformers
 
+    # Install the Helion chunk_gated_delta_rule monkeypatch BEFORE constructing
+    # the model. Qwen3NextGatedDeltaNet.__init__ captures a reference to
+    # ``chunk_gated_delta_rule`` at construction time, so patching after
+    # ``from_pretrained`` is too late. Safe to call unconditionally —
+    # install_delta_rule_monkeypatch() is a no-op when Helion isn't available
+    # or ``PARIS_DISABLE_HELION_DELTA=1``. See engine/kernels/delta_rule.py.
+    try:
+        from engine.kernels import install_delta_rule_monkeypatch
+        patched = install_delta_rule_monkeypatch()
+        log.info("delta_rule helion monkeypatch: %s", "applied" if patched else "skipped")
+    except Exception as e:
+        log.warning("delta_rule helion monkeypatch import failed: %s", e)
+
     log.info("loading config from %s", model_name_or_path)
     full_cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     text_cfg = getattr(full_cfg, "text_config", full_cfg)
