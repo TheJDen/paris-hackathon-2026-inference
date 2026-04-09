@@ -184,10 +184,67 @@ rules require.
 
 Returns canned `"ok"` text. Useful for verifying the OpenAI shape locally.
 
-## Running the evals (mirror what the harness does)
+## Iteration loop — throughput first, correctness as a pre-merge gate
 
-Use the harness scripts in `eval/` — they generate prompts at runtime
-exactly the way the official scoring will. **Do not pre-compute prompts.**
+We are scored on **weighted output tok/s** at concurrency 1..64. The
+high-concurrency levels carry the most weight (`c=16`+`c=32`+`c=64` =
+**16/22 ≈ 73% of the score**, and `c=64` alone is 8/22). The correctness
+eval is a hard gate but it does not move the score — we should run it
+**sparingly** (before pushing to main, after large changes, on CI),
+**not** on every per-change iteration.
+
+### Default per-change loop: quick throughput
+
+```bash
+.venv/bin/python -m bench.quick_throughput \
+  --base-url http://localhost:8765 \
+  --output profiles/throughput_<scenario>_<sha>.json
+```
+
+Defaults to **c=16, 32, 64** (the high-weight levels), 16 requests/level
+(vs the harness's 64), runtime random prompts via the same code path the
+official scoring uses (`eval.throughput.run_throughput.run_benchmark`).
+Finishes in ~1 minute on a working engine. Prints:
+
+- per-level tok/s + wall + spot-check results
+- the **partial weighted score** for the levels we ran
+- a rough extrapolation to all 7 levels (NOT the official number — just a
+  hint of where we'd land)
+- the engine's CLI region table fetched from `/metrics/regions` (so each
+  iteration drops a snapshot you can diff against the previous one)
+- the live `/metrics` snapshot (rolling-window tok/s, batch fill, etc.)
+
+For the full sweep that mirrors the official eval (~5x slower):
+
+```bash
+.venv/bin/python -m bench.quick_throughput \
+  --base-url http://localhost:8765 \
+  --concurrency 1 2 4 8 16 32 64 \
+  --num-requests 64
+```
+
+Or directly:
+
+```bash
+.venv/bin/python -m eval.throughput.run_throughput \
+  --base-url http://localhost:8765
+```
+
+### Pre-merge gate: full GSM8K-CoT (≥ 87.5%, ~3 min on Phase 1)
+
+Run **before pushing to main** and after any change that touches the model
+forward path or sampler. Do **not** run per-iteration.
+
+```bash
+.venv/bin/python -m eval.correctness.run_correctness \
+  --base-url http://localhost:8765 \
+  --num-concurrent 32 \
+  --output results/correctness_<sha>.json \
+  --output-dir results/correctness_raw_<sha>
+```
+
+A 20-problem mini check is too noisy at this sample size — just run the
+full 200. It's ~3 min.
 
 ### API conformance
 
@@ -195,33 +252,48 @@ exactly the way the official scoring will. **Do not pre-compute prompts.**
 .venv/bin/python -m eval.check_server --base-url http://localhost:8765
 ```
 
-### GSM8K-CoT correctness gate (≥ 87.5% required)
+### Final scoring (the official combined number)
 
 ```bash
-# fast iteration loop: 20 problems
-.venv/bin/python -m eval.correctness.run_correctness \
-  --base-url http://localhost:8765 \
-  --limit 20 --num-concurrent 32 \
-  --output-dir /tmp/mini_gsm8k
-
-# full 200-problem gate
-.venv/bin/python -m eval.correctness.run_correctness \
-  --base-url http://localhost:8765 \
-  --num-concurrent 32 \
-  --output results/correctness_phase1.json \
-  --output-dir results/correctness_raw
+.venv/bin/python -m eval.score \
+  --correctness results/correctness_<sha>.json \
+  --throughput results/throughput_<sha>.json
 ```
 
-### Throughput sweep (the thing we're scored on)
+## Throughput-aware metrics at `/metrics`
+
+The engine's `/metrics` endpoint gives you the throughput-relevant
+counters at any point during a run. The per-change loop is:
+**run quick_throughput → diff `/metrics` and `/metrics/regions` against the
+previous snapshot.**
 
 ```bash
-.venv/bin/python -m eval.throughput.run_throughput \
-  --base-url http://localhost:8765
+curl -s http://localhost:8765/metrics
 ```
 
-Concurrency levels 1, 2, 4, 8, 16, 32, 64, 64 requests per level, 1024 input /
-1024 output tokens, runtime random prompts + spot-checks. The scoring weights
-in `README.md` are skewed toward high concurrency.
+```json
+{
+  "tok_per_s_recent": 612.4,            # rolling 60s window — "right now"
+  "tok_per_s_lifetime": 549.0,
+  "prompt_tok_per_s_lifetime": 489.0,
+  "completion_tok_per_s_lifetime": 60.1,
+  "batch_tok_per_s_p50": 580.2,         # one batched generate's tok/s
+  "batch_tok_per_s_p99": 720.3,
+  "max_batch": 32,
+  "avg_batch_size": 24.4,
+  "avg_batch_fill": 0.762,              # how full the batches are
+  "running": 0,
+  "waiting": 0,
+  ...
+}
+```
+
+`avg_batch_fill < 0.5` is a clear signal that the batcher is leaving
+throughput on the floor — the window is too short or `num_concurrent` on
+the client side is too low.
+
+`tok_per_s_recent` is the number to watch when iterating. The `/metrics`
+endpoint costs nothing to hit so you can `watch -n 0.5 'curl -s …'`.
 
 ## Profiling — start with the CLI region table
 

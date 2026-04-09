@@ -102,6 +102,8 @@ class Engine:
         if not stub:
             self.tokenizer = ChatTokenizer(model_name)
 
+        metrics.set_max_batch_capacity(self.max_batch)
+
     # ------------------------------------------------------------------ #
     # public API
     # ------------------------------------------------------------------ #
@@ -282,7 +284,8 @@ class Engine:
                 attention_mask,
                 gen_kwargs,
             )
-            metrics.record_step(time.perf_counter() - t0, kind="prefill")
+            wall_s = time.perf_counter() - t0
+            metrics.record_step(wall_s, kind="prefill")
 
             # Slice each row's continuation, trim at first EOS, decode.
             with time_region("engine.batch.decode"):
@@ -320,6 +323,16 @@ class Engine:
                             finish_reason=finish_reason,
                         )
                     )
+
+            # Throughput accounting — the primary signal we iterate against.
+            total_prompt = sum(r.prompt_tokens for r in results)
+            total_completion = sum(r.completion_tokens for r in results)
+            metrics.record_batch_throughput(
+                batch_size=n,
+                prompt_tokens=total_prompt,
+                completion_tokens=total_completion,
+                wall_s=wall_s,
+            )
 
             for req, res in zip(batch, results):
                 if not req.future.done():
