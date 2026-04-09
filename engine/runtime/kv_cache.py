@@ -71,6 +71,14 @@ class BatchSlots:
     query_lens: torch.Tensor        # [B], int64
     kv_seq_lens: torch.Tensor       # [B], int64
     is_prefill: bool
+    # Optional perf hints from the runner — set during decode by the eager
+    # squeeze path so the cache can avoid recomputing max(kv_seq_lens).item()
+    # on every layer's get_seq_length / get_mask_sizes call.
+    max_kv_seq_len: int | None = None
+    # Optional dense flat write positions [B] (one int per row, in slot-local
+    # absolute coords). Set by the decode path when every row writes exactly
+    # one token. The cache may use this to skip rebuilding flat indices.
+    write_positions_flat: torch.Tensor | None = None
 
     @property
     def batch_size(self) -> int:
