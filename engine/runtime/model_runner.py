@@ -30,7 +30,6 @@ from engine.runtime.sequence import SamplingParams
 
 if TYPE_CHECKING:
     from engine.runtime.cuda_graphs import DecodeGraphCache
-    from engine.runtime.compile_helpers import warmup_compiled
 
 
 log = logging.getLogger(__name__)
@@ -51,7 +50,6 @@ class ModelRunner:
         num_slots: int,
         max_seq_len: int,
         enable_cuda_graphs: bool = True,
-        compile: bool = True,
     ) -> None:
         self.hf_model = hf_model
         self.text_config = text_config
@@ -69,133 +67,16 @@ class ModelRunner:
         self.cache = self._build_cache()
         log.info("model runner cache: %s", self.cache)
 
-        # torch.compile — wrap inner_model with Inductor.
-        # Must happen BEFORE CUDA graph init (reduce-overhead mode uses
-        # CUDA graphs internally; if both compile AND DecodeGraphCache are
-        # active they will conflict).  When compile=True we therefore force
-        # enable_cuda_graphs=False.
-        self._compile_enabled = compile and device.type == "cuda"
-        if self._compile_enabled:
-            if enable_cuda_graphs:
-                log.info(
-                    "model runner: torch.compile=True overrides enable_cuda_graphs "
-                    "(reduce-overhead mode owns CUDA graphs; DecodeGraphCache disabled)"
-                )
-            enable_cuda_graphs = False  # prevent double-graph conflict
-            self._apply_compile()
-
         # CUDA graph cache for the decode hot path (lazy init on first use).
         # Set to None when CUDA graphs are disabled (CPU device, stub mode,
-        # --no-cuda-graphs flag, or torch.compile=True above).
+        # or --no-cuda-graphs flag).
         self.decode_graphs: DecodeGraphCache | None = None
         if enable_cuda_graphs and device.type == "cuda":
             self._init_decode_graphs()
 
-        # Dedicated CUDA RNG generator for the sampler.  Using a separate
-        # generator prevents the default CUDA generator from being put into
-        # "graph mode" by CUDA graph capture (which saves/restores the default
-        # generator's RNG state and registers it for capture, causing
-        # torch.multinomial to raise "Offset increment outside graph capture"
-        # during prefill — before any graph has been replayed).
-        self._sampler_generator: torch.Generator | None = None
-        if device.type == "cuda":
-            self._sampler_generator = torch.Generator(device=device)
-            self._sampler_generator.manual_seed(0)
-
-        # ------------------------------------------------------------------
-        # Pre-allocated per-step decode buffers (CPU-staging + GPU targets).
-        # Eager decode used to build five fresh tensors per step via
-        # torch.tensor([...]), each of which forces a Python-to-C++ hop and a
-        # pageable host→device memcpy. We pre-allocate once here (sized to
-        # num_slots == max decode batch) and copy_ per step. The CPU staging
-        # buffers live in pinned memory when CUDA is available so the H2D
-        # copy is asynchronous.
-        # ------------------------------------------------------------------
-        self._decode_buf_capacity = num_slots
-        _pin = device.type == "cuda"
-        # CPU staging (pinned) — filled by Python per step.
-        self._dec_cpu_input_ids = torch.zeros(
-            num_slots, 1, dtype=torch.long, pin_memory=_pin
-        )
-        self._dec_cpu_position_ids = torch.zeros(
-            num_slots, 1, dtype=torch.long, pin_memory=_pin
-        )
-        self._dec_cpu_slot_ids = torch.zeros(
-            num_slots, dtype=torch.int64, pin_memory=_pin
-        )
-        self._dec_cpu_kv_seq_lens = torch.zeros(
-            num_slots, dtype=torch.int64, pin_memory=_pin
-        )
-        self._dec_cpu_attn_mask = torch.zeros(
-            num_slots, max_seq_len, dtype=torch.long, pin_memory=_pin
-        )
-        self._dec_cpu_temps = torch.zeros(
-            num_slots, dtype=torch.float32, pin_memory=_pin
-        )
-        self._dec_cpu_top_ps = torch.ones(
-            num_slots, dtype=torch.float32, pin_memory=_pin
-        )
-        # GPU targets — sized to the max decode batch + max_seq_len.
-        self._dec_gpu_input_ids = torch.zeros(
-            num_slots, 1, dtype=torch.long, device=device
-        )
-        self._dec_gpu_position_ids = torch.zeros(
-            num_slots, 1, dtype=torch.long, device=device
-        )
-        self._dec_gpu_slot_ids = torch.zeros(
-            num_slots, dtype=torch.int64, device=device
-        )
-        self._dec_gpu_kv_seq_lens = torch.zeros(
-            num_slots, dtype=torch.int64, device=device
-        )
-        self._dec_gpu_attn_mask = torch.zeros(
-            num_slots, max_seq_len, dtype=torch.long, device=device
-        )
-        self._dec_gpu_temps = torch.zeros(
-            num_slots, dtype=torch.float32, device=device
-        )
-        self._dec_gpu_top_ps = torch.ones(
-            num_slots, dtype=torch.float32, device=device
-        )
-        # Pre-build write-positions tensor of shape [num_slots, 1] on GPU so
-        # decode can avoid building B fresh one-element tensors per step. We
-        # hand out per-row *views* (narrow(0, i, 1)) each step.
-        self._dec_gpu_write_positions = torch.zeros(
-            num_slots, 1, dtype=torch.int64, device=device
-        )
-
-        # Warmup: fire the compile before the first real request.
-        if self._compile_enabled:
-            self._warmup_compile()
-
     # ------------------------------------------------------------------ #
     # construction
     # ------------------------------------------------------------------ #
-
-    def _apply_compile(self) -> None:
-        """Apply dynamo disables + torch.compile to self.inner_model."""
-        from engine.runtime.compile_helpers import apply_dynamo_disables, compile_model
-
-        log.info("model runner: applying dynamo disables (cache + linear-attn)")
-        apply_dynamo_disables(self.hf_model)
-
-        log.info("model runner: wrapping inner_model with torch.compile")
-        self.inner_model = compile_model(
-            self.hf_model,
-            mode="reduce-overhead",
-            dynamic=True,
-        )
-        log.info("model runner: torch.compile wrapper installed (lazy — fires on first forward)")
-
-    def _warmup_compile(self) -> None:
-        """Fire the compile with dummy tensors before the first real request."""
-        from engine.runtime.compile_helpers import warmup_compiled
-
-        warmup_compiled(
-            self,
-            max_batch=min(8, self.num_slots),
-            max_seq=min(2048, self.max_seq_len),
-        )
 
     def _init_decode_graphs(self) -> None:
         """Instantiate the DecodeGraphCache (lazy; graphs captured on demand)."""
@@ -261,27 +142,11 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
 
     @torch.inference_mode()
-    def prefill(
-        self,
-        slot_id: int,
-        prompt_token_ids: list[int],
-        sampling: SamplingParams | None = None,
-        prefix_offset: int = 0,
-    ) -> int:
+    def prefill(self, slot_id: int, prompt_token_ids: list[int], sampling: SamplingParams | None = None) -> int:
         """Prefill one slot with its prompt and return the first sampled token.
 
         Phase 2a v0: prefill one slot at a time. Phase 2b will batch
         prefills with chunking.
-
-        Args:
-            prefix_offset: if > 0, the slot already has ``prefix_offset`` tokens
-                           cached (copied from the shared-prefix reserved slot).
-                           ``prompt_token_ids`` should contain ONLY the suffix
-                           tokens (prompt[prefix_offset:]).  Write positions and
-                           position_ids are shifted by ``prefix_offset``
-                           accordingly.  ``kv_seq_lens`` is set to
-                           ``prefix_offset + L`` so attention sees the full
-                           context.
         """
         with time_region("runner.prefill"):
             L = len(prompt_token_ids)
@@ -289,16 +154,13 @@ class ModelRunner:
                 [prompt_token_ids], dtype=torch.long, device=self.device
             )
 
-            # Build batch routing: one row.
-            # When prefix_offset > 0 the slot already has the first
-            # prefix_offset positions cached; we write suffix tokens at
-            # positions [prefix_offset, prefix_offset + L).
+            # Build batch routing: one row, write positions 0..L-1.
             slot_ids = torch.tensor([slot_id], dtype=torch.int64, device=self.device)
             write_positions = [
-                torch.arange(prefix_offset, prefix_offset + L, dtype=torch.int64, device=self.device)
+                torch.arange(L, dtype=torch.int64, device=self.device)
             ]
             query_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor([prefix_offset + L], dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor([L], dtype=torch.int64, device=self.device)
             self.cache.set_batch(
                 BatchSlots(
                     slot_ids=slot_ids,
@@ -309,13 +171,8 @@ class ModelRunner:
                 )
             )
 
-            position_ids = torch.arange(
-                prefix_offset, prefix_offset + L, dtype=torch.long, device=self.device
-            ).unsqueeze(0)
-            # Attention mask must cover the full context (prefix + suffix).
-            # Build a 1 × (prefix_offset + L) mask of ones.
-            full_len = prefix_offset + L
-            attention_mask = torch.ones(1, full_len, dtype=torch.long, device=self.device)
+            position_ids = torch.arange(L, dtype=torch.long, device=self.device).unsqueeze(0)
+            attention_mask = torch.ones(1, L, dtype=torch.long, device=self.device)
 
             with time_region("runner.prefill.model_forward"):
                 outputs = self.inner_model(
@@ -352,7 +209,6 @@ class ModelRunner:
         slot_ids: list[int],
         prompt_token_ids_list: list[list[int]],
         samplings: list,
-        prefix_offsets: list[int] | None = None,
     ) -> list[int]:
         """Prefill B slots in one padded forward pass and return first tokens.
 
@@ -362,43 +218,21 @@ class ModelRunner:
         for real tokens.  The cache update() slices each row to its real
         length so no garbage K/V from pad positions is written to the slot pool.
 
-        Args:
-            prefix_offsets: optional list of per-row prefix offsets.  When
-                ``prefix_offsets[b] > 0``, row b's slot already has
-                ``prefix_offsets[b]`` tokens cached (copied from the shared
-                prefix reserved slot).  ``prompt_token_ids_list[b]`` must
-                contain ONLY the suffix tokens (original_prompt[offset:]).
-                Write positions and position_ids for that row are shifted by
-                the offset; kv_seq_lens accounts for the full context length.
-                If all offsets are 0 (or prefix_offsets is None), behavior is
-                identical to the original implementation.
-
         Returns a list of B first-token ids, one per sequence.
         """
         with time_region("runner.prefill_batch"):
             B = len(slot_ids)
-            if prefix_offsets is None:
-                prefix_offsets = [0] * B
 
             # Fast path: single sequence — delegate to the single-slot path
             # to avoid any overhead from the batched code path.
             if B == 1:
-                return [self.prefill(
-                    slot_ids[0],
-                    prompt_token_ids_list[0],
-                    samplings[0],
-                    prefix_offset=prefix_offsets[0],
-                )]
+                return [self.prefill(slot_ids[0], prompt_token_ids_list[0], samplings[0])]
 
-            # ``real_lens[b]`` = number of suffix tokens for row b.
-            # ``full_lens[b]`` = prefix_offset[b] + real_lens[b] (total context).
             real_lens = [len(p) for p in prompt_token_ids_list]
-            offsets = prefix_offsets  # alias for clarity
-            full_lens = [offsets[b] + real_lens[b] for b in range(B)]
-            max_L = max(real_lens)          # maximum suffix length (for input tensor)
-            max_full = max(full_lens)       # maximum total context (for attention mask)
+            max_L = max(real_lens)
 
-            # Pick a pad token id.
+            # Pick a pad token id. Use eos_token_id if the model exposes one
+            # via inner_model.config; fall back to 0. The mask gates it.
             pad_token_id = 0
             config = getattr(self.inner_model, "config", None)
             if config is not None:
@@ -406,7 +240,7 @@ class ModelRunner:
                 if eos is not None:
                     pad_token_id = eos if isinstance(eos, int) else eos[0]
 
-            # Build [B, max_L] input_ids with right-padding (suffix tokens only).
+            # Build [B, max_L] input_ids with right-padding.
             input_ids_np = torch.full(
                 (B, max_L), fill_value=pad_token_id, dtype=torch.long, device=self.device
             )
@@ -416,35 +250,25 @@ class ModelRunner:
                 )
             input_ids = input_ids_np  # [B, max_L]
 
-            # attention_mask: [B, max_full].
-            # For prefix-cached rows, positions 0..offset-1 are already in the
-            # cache and must appear as attended tokens in the mask; real suffix
-            # positions offset..full_len-1 are also 1; pad is 0.
-            attention_mask = torch.zeros(B, max_full, dtype=torch.long, device=self.device)
+            # attention_mask: 1 for real tokens, 0 for pad.
+            attention_mask = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
             for b in range(B):
-                attention_mask[b, : full_lens[b]] = 1
+                attention_mask[b, : real_lens[b]] = 1
 
-            # position_ids: [B, max_L] — suffix positions only (the model sees
-            # only the suffix input_ids, but at the right absolute positions).
-            # Row b: positions offsets[b], offsets[b]+1, ..., offsets[b]+real_lens[b]-1
-            # Pad positions get a value == full_lens[b] (out of range, gated by mask).
-            position_ids = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
-            for b in range(B):
-                position_ids[b, : real_lens[b]] = torch.arange(
-                    offsets[b], full_lens[b], dtype=torch.long, device=self.device
-                )
-                if real_lens[b] < max_L:
-                    position_ids[b, real_lens[b] :] = full_lens[b]
+            # position_ids: [B, max_L].  Real positions are correct; pad
+            # positions get an out-of-range value but the mask gates them.
+            position_ids = torch.arange(max_L, dtype=torch.long, device=self.device).unsqueeze(0).expand(B, -1)
 
-            # BatchSlots: per-row write_positions are the suffix positions in
-            # the slot pool (offset..full_len-1), not 0..real_len-1.
+            # BatchSlots: per-row write_positions carry REAL lengths only.
+            # kv_cache.update() will slice key_states[b, :, :real_len_b, :]
+            # before writing, so pad positions never touch the cache pool.
             slot_ids_t = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
             write_positions = [
-                torch.arange(offsets[b], full_lens[b], dtype=torch.int64, device=self.device)
+                torch.arange(real_lens[b], dtype=torch.int64, device=self.device)
                 for b in range(B)
             ]
             query_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor(full_lens, dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
             self.cache.set_batch(
                 BatchSlots(
                     slot_ids=slot_ids_t,
@@ -466,9 +290,10 @@ class ModelRunner:
             self.cache.commit_batch()
 
             # hidden_states: [B, max_L, hidden].
-            # Extract last-real-position hidden state per row (index real_lens[b]-1).
+            # Extract last-real-position hidden state per row.
             hidden_states = outputs.last_hidden_state  # [B, max_L, hidden]
             hidden_dim = hidden_states.shape[-1]
+            # Index of the last real token per row: real_lens[b] - 1.
             last_real_idx = torch.tensor(
                 [l - 1 for l in real_lens], dtype=torch.long, device=self.device
             )  # [B]
@@ -500,191 +325,6 @@ class ModelRunner:
             return [int(t.item()) for t in next_tokens]
 
     @torch.inference_mode()
-    def mixed_step(
-        self,
-        decode_slot_ids: list[int],
-        decode_last_tokens: list[int],
-        decode_cache_lengths: list[int],
-        decode_samplings: list[SamplingParams] | None,
-        prefill_slot_ids: list[int],
-        prefill_token_ids_list: list[list[int]],
-        prefill_samplings: list,
-        prefill_offsets: list[int] | None = None,
-    ) -> tuple[list[int], list[int]]:
-        """Chunked-prefill-style mixed step: decode rows + prefill rows in ONE forward.
-
-        Decode rows contribute query_len=1 (the just-sampled token).
-        Prefill rows contribute query_len=L_r (their full suffix).
-
-        Layout of the combined batch:
-            rows [0..D)        = decode rows (query_len=1)
-            rows [D..D+P)      = prefill rows (query_len=L_r)
-
-        Ragged kv handling: each row r has an effective kv length:
-            decode row r:  cache_lengths[r] + 1
-            prefill row r: offsets[r] + L_r
-        We pass attention_mask of shape [B, max_full] with 1s on
-        [0..effective_kv_len_r) — exactly as prefill_batch already does.
-        The kv_cache.update() slices each row to its real write positions so
-        no pad K/V pollutes the slot pool.
-
-        Returns:
-            (decode_next_tokens, prefill_first_tokens)
-        """
-        D = len(decode_slot_ids)
-        P = len(prefill_slot_ids)
-        assert D == len(decode_last_tokens) == len(decode_cache_lengths)
-        assert P == len(prefill_token_ids_list) == len(prefill_samplings)
-
-        # Trivial fallbacks so warmup / single-class callers stay cheap.
-        if D == 0 and P == 0:
-            return [], []
-        if P == 0:
-            toks = self.decode(
-                decode_slot_ids, decode_last_tokens, decode_cache_lengths, decode_samplings
-            )
-            return toks, []
-        if D == 0:
-            toks = self.prefill_batch(
-                prefill_slot_ids,
-                prefill_token_ids_list,
-                prefill_samplings,
-                prefix_offsets=prefill_offsets,
-            )
-            return [], toks
-
-        with time_region("runner.mixed_step"):
-            if prefill_offsets is None:
-                prefill_offsets = [0] * P
-
-            # Per-row real query lens (how many new token positions to write).
-            real_lens: list[int] = [1] * D + [len(p) for p in prefill_token_ids_list]
-            # Full kv length per row (for attention mask).
-            full_lens: list[int] = (
-                [decode_cache_lengths[i] + 1 for i in range(D)]
-                + [prefill_offsets[i] + len(prefill_token_ids_list[i]) for i in range(P)]
-            )
-            # Per-row starting write position (absolute slot position where the
-            # new tokens land).
-            start_pos: list[int] = (
-                [decode_cache_lengths[i] for i in range(D)]
-                + [prefill_offsets[i] for i in range(P)]
-            )
-
-            B = D + P
-            max_L = max(real_lens)
-            max_full = max(full_lens)
-
-            # Pad token.
-            pad_token_id = 0
-            config = getattr(self.inner_model, "config", None)
-            if config is not None:
-                eos = getattr(config, "eos_token_id", None)
-                if eos is not None:
-                    pad_token_id = eos if isinstance(eos, int) else eos[0]
-
-            # input_ids: [B, max_L], right-padded.
-            input_ids = torch.full(
-                (B, max_L), fill_value=pad_token_id, dtype=torch.long, device=self.device
-            )
-            for i in range(D):
-                input_ids[i, 0] = decode_last_tokens[i]
-            for j, prompt in enumerate(prefill_token_ids_list):
-                input_ids[D + j, : len(prompt)] = torch.tensor(
-                    prompt, dtype=torch.long, device=self.device
-                )
-
-            # attention_mask: [B, max_full] — 1s for real kv positions (cache
-            # already contains [0..start_pos[r]) and this step writes
-            # [start_pos[r]..full_lens[r])).
-            attention_mask = torch.zeros(B, max_full, dtype=torch.long, device=self.device)
-            for r in range(B):
-                attention_mask[r, : full_lens[r]] = 1
-
-            # position_ids: [B, max_L]. Real positions are arange(start, start+L_r);
-            # pad positions get full_lens[r] (out of range, gated by mask).
-            position_ids = torch.zeros(B, max_L, dtype=torch.long, device=self.device)
-            for r in range(B):
-                L_r = real_lens[r]
-                position_ids[r, :L_r] = torch.arange(
-                    start_pos[r], start_pos[r] + L_r, dtype=torch.long, device=self.device
-                )
-                if L_r < max_L:
-                    position_ids[r, L_r:] = full_lens[r]
-
-            # BatchSlots: per-row write positions, query_lens, kv_seq_lens.
-            all_slot_ids = list(decode_slot_ids) + list(prefill_slot_ids)
-            slot_ids_t = torch.tensor(all_slot_ids, dtype=torch.int64, device=self.device)
-            write_positions = [
-                torch.arange(
-                    start_pos[r], start_pos[r] + real_lens[r],
-                    dtype=torch.int64, device=self.device,
-                )
-                for r in range(B)
-            ]
-            query_lens = torch.tensor(real_lens, dtype=torch.int64, device=self.device)
-            kv_seq_lens = torch.tensor(full_lens, dtype=torch.int64, device=self.device)
-            # Mixed batch: mark is_prefill=True so the cache path takes the
-            # ragged/variable-length write branch (same path prefill_batch uses).
-            self.cache.set_batch(
-                BatchSlots(
-                    slot_ids=slot_ids_t,
-                    write_positions=write_positions,
-                    query_lens=query_lens,
-                    kv_seq_lens=kv_seq_lens,
-                    is_prefill=True,
-                )
-            )
-
-            with time_region("runner.mixed_step.model_forward"):
-                outputs = self.inner_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=self.cache,
-                    use_cache=True,
-                )
-            self.cache.commit_batch()
-
-            hidden_states = outputs.last_hidden_state  # [B, max_L, hidden]
-            hidden_dim = hidden_states.shape[-1]
-            # Sample the last-real-position per row. For decode rows that's
-            # index 0; for prefill rows that's index L_r-1.
-            last_real_idx = torch.tensor(
-                [real_lens[r] - 1 for r in range(B)], dtype=torch.long, device=self.device
-            )
-            last_hidden = hidden_states.gather(
-                dim=1,
-                index=last_real_idx.view(B, 1, 1).expand(B, 1, hidden_dim),
-            ).squeeze(1)  # [B, hidden]
-
-            with time_region("runner.mixed_step.lm_head"):
-                logits = self.lm_head(last_hidden)  # [B, vocab]
-
-            # Build per-row temps/top_ps for sampling.
-            temps_list: list[float] = []
-            top_ps_list: list[float] = []
-            if decode_samplings is not None:
-                for s in decode_samplings:
-                    temps_list.append(s.temperature if s is not None else 0.0)
-                    top_ps_list.append(s.top_p if s is not None else 1.0)
-            else:
-                temps_list.extend([0.0] * D)
-                top_ps_list.extend([1.0] * D)
-            for s in prefill_samplings:
-                temps_list.append(s.temperature if s is not None else 0.0)
-                top_ps_list.append(s.top_p if s is not None else 1.0)
-
-            temps = torch.tensor(temps_list, dtype=torch.float32, device=self.device)
-            top_ps = torch.tensor(top_ps_list, dtype=torch.float32, device=self.device)
-
-            with time_region("runner.mixed_step.sample"):
-                next_tokens = self._sample(logits, temps, top_ps)  # [B]
-
-            result = [int(t.item()) for t in next_tokens]
-            return result[:D], result[D:]
-
-    @torch.inference_mode()
     def decode(
         self,
         slot_ids: list[int],
@@ -708,81 +348,46 @@ class ModelRunner:
             B = len(slot_ids)
             assert B == len(last_tokens) == len(cache_lengths)
 
-            # ---- Build per-step tensors using pre-allocated buffers ----
-            # We stage into pinned-CPU buffers (single Python→C++ hop per
-            # tensor instead of one per row) and issue a batched async H2D
-            # copy. The previous implementation built five fresh tensors per
-            # step via torch.tensor([...]), each of which walked Python
-            # list→C++ and did its own pageable memcpy.
-            max_s = 0
-            cpu_input_ids = self._dec_cpu_input_ids
-            cpu_position_ids = self._dec_cpu_position_ids
-            cpu_slot_ids = self._dec_cpu_slot_ids
-            cpu_kv_seq_lens = self._dec_cpu_kv_seq_lens
-            cpu_attn_mask = self._dec_cpu_attn_mask
-            for b in range(B):
-                cl = cache_lengths[b]
-                cpu_input_ids[b, 0] = last_tokens[b]
-                cpu_position_ids[b, 0] = cl
-                cpu_slot_ids[b] = slot_ids[b]
-                full = cl + 1
-                cpu_kv_seq_lens[b] = full
-                if full > max_s:
-                    max_s = full
-            # Zero out the active portion of the attention mask in bulk,
-            # then fill [0, full_len) with 1s row by row. `fill_` on a slice
-            # is cheaper than constructing a fresh zeros tensor on GPU.
-            cpu_attn_mask[:B, :max_s].zero_()
-            for b in range(B):
-                cpu_attn_mask[b, : cache_lengths[b] + 1] = 1
-
-            # Single async H2D copy for each buffer (pinned → device).
-            non_blocking = self.device.type == "cuda"
-            self._dec_gpu_input_ids[:B].copy_(cpu_input_ids[:B], non_blocking=non_blocking)
-            self._dec_gpu_position_ids[:B].copy_(cpu_position_ids[:B], non_blocking=non_blocking)
-            self._dec_gpu_slot_ids[:B].copy_(cpu_slot_ids[:B], non_blocking=non_blocking)
-            self._dec_gpu_kv_seq_lens[:B].copy_(cpu_kv_seq_lens[:B], non_blocking=non_blocking)
-            self._dec_gpu_attn_mask[:B, :max_s].copy_(
-                cpu_attn_mask[:B, :max_s], non_blocking=non_blocking
-            )
-            # write_positions = position_ids view (they match in decode: the
-            # absolute slot position of the new token == cache_lengths[b]).
-            self._dec_gpu_write_positions[:B].copy_(
-                cpu_position_ids[:B], non_blocking=non_blocking
+            # ---- Build per-step tensors (always eager, always outside graph) ----
+            input_ids = torch.tensor(
+                [[t] for t in last_tokens], dtype=torch.long, device=self.device
+            )  # [B, 1]
+            slot_ids_t = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
+            write_positions = [
+                torch.tensor([cache_lengths[i]], dtype=torch.int64, device=self.device)
+                for i in range(B)
+            ]
+            query_lens = torch.ones(B, dtype=torch.int64, device=self.device)
+            kv_seq_lens = torch.tensor(
+                [cache_lengths[i] + 1 for i in range(B)],
+                dtype=torch.int64, device=self.device,
             )
 
-            input_ids = self._dec_gpu_input_ids[:B]
-            position_ids = self._dec_gpu_position_ids[:B]
-            attention_mask = self._dec_gpu_attn_mask[:B, :max_s]
-            slot_ids_t = self._dec_gpu_slot_ids[:B]
-            kv_seq_lens = self._dec_gpu_kv_seq_lens[:B]
-            # Per-row write_positions list is not used on the decode fast
-            # path — the cache reads `write_positions_flat` instead. We pass
-            # an empty list to avoid building B 1-elem views per step.
-            write_positions: list[torch.Tensor] = []
-            # query_lens is always all-ones for decode; lazily reuse a cached
-            # ones tensor of the needed size.
-            if getattr(self, "_dec_gpu_query_lens_cache", None) is None or \
-                    self._dec_gpu_query_lens_cache.shape[0] < self._decode_buf_capacity:
-                self._dec_gpu_query_lens_cache = torch.ones(
-                    self._decode_buf_capacity, dtype=torch.int64, device=self.device
-                )
-            query_lens = self._dec_gpu_query_lens_cache[:B]
+            # position_ids[b] = cache_lengths[b] (the absolute position of the new token)
+            position_ids = torch.tensor(
+                [[cache_lengths[i]] for i in range(B)],
+                dtype=torch.long, device=self.device,
+            )
+            # attention_mask: padded to max kv_seq_len, mask out empty positions.
+            # For the graph path, this is copied into the static buffer (which is
+            # sized to max_seq_len); for the eager path it's used directly.
+            max_s = int(kv_seq_lens.max().item())
+            attention_mask = torch.zeros(B, max_s, dtype=torch.long, device=self.device)
+            for b in range(B):
+                attention_mask[b, : cache_lengths[b] + 1] = 1
 
             # ---- Cache set_batch is ALWAYS outside the graph ----
             # gather_for_batch (index_select + clone) is not graph-safe because
             # it allocates new tensors with data-dependent indices each call.
-            batch = BatchSlots(
-                slot_ids=slot_ids_t,
-                write_positions=write_positions,
-                query_lens=query_lens,
-                kv_seq_lens=kv_seq_lens,
-                is_prefill=False,
-                max_kv_seq_len=max_s,
-                # Flat write positions == position_ids view, 1 token per row.
-                write_positions_flat=self._dec_gpu_write_positions[:B].view(-1),
+            self.cache.set_batch(
+                BatchSlots(
+                    slot_ids=slot_ids_t,
+                    write_positions=write_positions,
+                    query_lens=query_lens,
+                    kv_seq_lens=kv_seq_lens,
+                    is_prefill=False,
+                )
             )
-            self.cache.set_batch(batch)
 
             # ---- Model forward + lm_head ----
             if self.decode_graphs is not None:
@@ -815,33 +420,20 @@ class ModelRunner:
 
             # ---- Sampler — always eager, outside the graph ----
             with time_region("runner.decode.sample"):
-                # Greedy fast-path: skip building per-row temp/top_p tensors
-                # entirely when every row is greedy (which is the common
-                # benchmark case). Saves two host→device tensor constructions
-                # plus the _sample `.all()` reduction check.
-                all_greedy = True
                 if samplings is not None:
-                    for s in samplings:
-                        if s is not None and s.temperature > 0.0:
-                            all_greedy = False
-                            break
-                if all_greedy:
-                    next_tokens = torch.argmax(logits, dim=-1)
+                    temps = torch.tensor(
+                        [s.temperature for s in samplings],
+                        dtype=torch.float32, device=self.device,
+                    )
+                    top_ps = torch.tensor(
+                        [s.top_p for s in samplings],
+                        dtype=torch.float32, device=self.device,
+                    )
                 else:
-                    cpu_temps = self._dec_cpu_temps
-                    cpu_top_ps = self._dec_cpu_top_ps
-                    for b, s in enumerate(samplings):
-                        cpu_temps[b] = s.temperature if s is not None else 0.0
-                        cpu_top_ps[b] = s.top_p if s is not None else 1.0
-                    self._dec_gpu_temps[:B].copy_(cpu_temps[:B], non_blocking=non_blocking)
-                    self._dec_gpu_top_ps[:B].copy_(cpu_top_ps[:B], non_blocking=non_blocking)
-                    next_tokens = self._sample(
-                        logits, self._dec_gpu_temps[:B], self._dec_gpu_top_ps[:B]
-                    )  # [B]
-            # Single D2H via tolist() — one sync instead of B syncs from
-            # [int(t.item()) for t in next_tokens]. tolist() for a small
-            # int64 vector is fused into a single copy.
-            return next_tokens.tolist()
+                    temps = torch.zeros(B, dtype=torch.float32, device=self.device)
+                    top_ps = torch.ones(B, dtype=torch.float32, device=self.device)
+                next_tokens = self._sample(logits, temps, top_ps)  # [B]
+            return [int(t.item()) for t in next_tokens]
 
     # ------------------------------------------------------------------ #
     # sampling — greedy fast-path + temperature / top-p nucleus sampling
@@ -912,9 +504,7 @@ class ModelRunner:
 
         # Sample from the filtered distribution.
         probs = torch.softmax(filtered_logits, dim=-1)  # [B, vocab]
-        stochastic_tokens = torch.multinomial(
-            probs, num_samples=1, generator=self._sampler_generator
-        ).squeeze(1)  # [B]
+        stochastic_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
 
         # Greedy tokens (argmax on the original logits, not scaled).
         greedy_tokens = torch.argmax(logits_f, dim=-1)  # [B]

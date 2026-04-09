@@ -40,7 +40,6 @@ import time
 from dataclasses import dataclass
 
 from engine.runtime.model_runner import ModelRunner
-from engine.runtime.prefix_cache import PrefixCache
 from engine.runtime.profiling import time_region
 from engine.runtime.sequence import (
     GenerationResult,
@@ -68,15 +67,6 @@ class SchedulerConfig:
     # Soft co-scheduling knob: how many steps of decode we let happen between
     # prefill admissions, when there are sequences waiting AND decoding.
     decode_steps_per_prefill: int = 1
-    # Phase 2a chunked-prefill wiring: when True, scheduler.step() fuses
-    # decode + prefill into ONE runner.mixed_step() forward pass so decode
-    # never stalls for an independent prefill batch. Disable to fall back
-    # to the classic prefill-OR-decode path.
-    use_mixed_step: bool = False  # disabled — first measurement showed 447 vs 816 baseline regression
-    # When mixed_step is active, cap how many waiting sequences are admitted
-    # into the same forward pass as the running decode batch. Higher = faster
-    # ramp-up but slower per-step time (prefill rows pad max_L upward).
-    max_prefill_admit_per_step: int = 8
 
 
 class Scheduler:
@@ -93,13 +83,6 @@ class Scheduler:
 
         self._step_count = 0
         self._steps_since_prefill = 0
-
-        # Prefix cache — set by Engine after warm_up().  None means disabled.
-        self.prefix_cache: PrefixCache | None = None
-
-        # Telemetry counters.
-        self._prefix_hits: int = 0
-        self._prefix_misses: int = 0
 
     # ------------------------------------------------------------------ #
     # public API
@@ -127,21 +110,6 @@ class Scheduler:
             self._step_count += 1
             finished: list[Sequence] = []
 
-            # Phase 2a chunked-prefill path: fuse decode + prefill into a
-            # single runner.mixed_step() forward pass so decode never stalls
-            # for an independent prefill batch.
-            if self.config.use_mixed_step:
-                try:
-                    result = self._mixed_step_unified(finished)
-                    if result is not None:
-                        return result
-                except Exception as e:
-                    log.exception(
-                        "mixed_step unified path failed, falling back to "
-                        "legacy prefill/decode split: %s", e,
-                    )
-                    # Fall through to legacy path below.
-
             # 1. Try to admit a new sequence if a slot is free.
             should_prefill = (
                 self.waiting
@@ -154,52 +122,26 @@ class Scheduler:
 
             if should_prefill:
                 with time_region("scheduler.admit_prefill"):
-                    # Length bucketing DISABLED — small length variance was
-                    # splitting sequences across buckets and starving the batch.
-                    # Simple FIFO admit: take up to max_prefill_batch from the
-                    # head of the waiting queue.
+                    # Admit up to max_prefill_batch sequences in one step.
+                    # This amortises scheduler overhead over the whole batch
+                    # and fills the decode pool faster at high concurrency.
                     batch_seqs: list[Sequence] = []
-                    max_admit = min(self.config.max_prefill_batch, len(self.free_slots))
-                    for _ in range(max_admit):
-                        if not self.waiting:
-                            break
-                        batch_seqs.append(self.waiting.popleft())
-
                     prefill_t0 = time.perf_counter()
-                    for seq in batch_seqs:
+                    for _ in range(self.config.max_prefill_batch):
+                        if not self.waiting or not self.free_slots:
+                            break
+                        seq = self.waiting.popleft()
                         slot_id = self.free_slots.popleft()
                         seq.slot_idx = slot_id
                         seq.status = SequenceStatus.PREFILLING
                         seq.prefill_started_at = prefill_t0
-
-                    # --- Prefix caching: copy shared prefix K/V into each slot ---
-                    # For sequences whose prompt starts with the cached prefix,
-                    # copy prefix K/V from the reserved slot into the new slot,
-                    # then pass only the suffix tokens to prefill_batch with the
-                    # appropriate position offset.
-                    prefix_offsets: list[int] = [0] * len(batch_seqs)
-                    suffix_token_ids: list[list[int]] = [s.prompt_token_ids for s in batch_seqs]
-                    if self.prefix_cache is not None and self.prefix_cache.ready:
-                        pc = self.prefix_cache
-                        for i, seq in enumerate(batch_seqs):
-                            if pc.matches(seq.prompt_token_ids):
-                                pc.apply_to_slot(seq.slot_idx)
-                                prefix_offsets[i] = pc.prefix_len
-                                suffix_token_ids[i] = seq.prompt_token_ids[pc.prefix_len:]
-                                self._prefix_hits += 1
-                                log.debug(
-                                    "prefix_cache hit: seq=%s slot=%d prefix_len=%d suffix_len=%d",
-                                    seq.request_id, seq.slot_idx, pc.prefix_len, len(suffix_token_ids[i]),
-                                )
-                            else:
-                                self._prefix_misses += 1
+                        batch_seqs.append(seq)
 
                     try:
                         first_tokens = self.runner.prefill_batch(
                             [s.slot_idx for s in batch_seqs],
-                            suffix_token_ids,
+                            [s.prompt_token_ids for s in batch_seqs],
                             [s.sampling for s in batch_seqs],
-                            prefix_offsets=prefix_offsets,
                         )
                     except Exception as e:
                         log.exception(
@@ -229,20 +171,10 @@ class Scheduler:
             if self.running and not should_prefill:
                 with time_region("scheduler.decode_step"):
                     self._steps_since_prefill += 1
-                    # Single pass over self.running: build all four lists
-                    # together instead of sorted() + 3 list comprehensions +
-                    # per-item dict lookups. Dict insertion order is stable
-                    # and the runner keys into slot_ids[] explicitly, so
-                    # ordering is fine.
-                    slot_ids: list[int] = []
-                    seqs: list[Sequence] = []
-                    last_tokens: list[int] = []
-                    cache_lengths: list[int] = []
-                    for sid, s in self.running.items():
-                        slot_ids.append(sid)
-                        seqs.append(s)
-                        last_tokens.append(s.output_token_ids[-1])
-                        cache_lengths.append(s.total_len - 1)
+                    slot_ids = sorted(self.running.keys())
+                    seqs = [self.running[s] for s in slot_ids]
+                    last_tokens = [s.output_token_ids[-1] for s in seqs]
+                    cache_lengths = [s.total_len - 1 for s in seqs]
                     # cache_lengths is the absolute position of the next
                     # token. Right now slot has prompt + output_len tokens
                     # cached, the new token will land at index total_len-1
@@ -285,146 +217,6 @@ class Scheduler:
             )
 
             return finished
-
-    # ------------------------------------------------------------------ #
-    # Phase 2a: chunked-prefill unified step
-    # ------------------------------------------------------------------ #
-
-    def _mixed_step_unified(self, finished: list[Sequence]) -> list[Sequence] | None:
-        """One forward pass that fuses running decode with newly-admitted prefills.
-
-        Returns the finished list on success (caller returns it immediately).
-        Returns None if there's nothing to do this step so the caller can
-        fall through. Raises on runner failure — caller catches and falls
-        back to the legacy prefill/decode split path.
-        """
-        cfg = self.config
-
-        # --- Pick decode rows: everything currently running. ---
-        decode_slot_ids_order = sorted(self.running.keys())
-        decode_seqs: list[Sequence] = [self.running[s] for s in decode_slot_ids_order]
-        D = len(decode_seqs)
-
-        # --- Decide how many waiting seqs to admit into THIS forward. ---
-        # Heuristic: if the running decode batch is already hot (>= 75% of
-        # max_decode_batch), skip prefill admission — admitting now would
-        # balloon max_L and drag the decode batch. Prefill fires next step.
-        admit_budget = 0
-        if self.waiting and self.free_slots:
-            batch_hot = D >= int(cfg.max_decode_batch * 0.75)
-            if not batch_hot:
-                admit_budget = min(
-                    cfg.max_prefill_admit_per_step,
-                    len(self.free_slots),
-                    len(self.waiting),
-                )
-
-        # Nothing at all to do.
-        if D == 0 and admit_budget == 0:
-            return None
-
-        # --- Admit prefill seqs (mirror legacy admit_prefill bookkeeping). ---
-        batch_seqs: list[Sequence] = []
-        if admit_budget > 0:
-            with time_region("scheduler.admit_prefill"):
-                for _ in range(admit_budget):
-                    if not self.waiting:
-                        break
-                    batch_seqs.append(self.waiting.popleft())
-                prefill_t0 = time.perf_counter()
-                for seq in batch_seqs:
-                    slot_id = self.free_slots.popleft()
-                    seq.slot_idx = slot_id
-                    seq.status = SequenceStatus.PREFILLING
-                    seq.prefill_started_at = prefill_t0
-
-        # --- Prefix cache: copy shared prefix K/V into each admitted slot. ---
-        prefill_offsets: list[int] = [0] * len(batch_seqs)
-        suffix_token_ids: list[list[int]] = [s.prompt_token_ids for s in batch_seqs]
-        if batch_seqs and self.prefix_cache is not None and self.prefix_cache.ready:
-            pc = self.prefix_cache
-            for i, seq in enumerate(batch_seqs):
-                if pc.matches(seq.prompt_token_ids):
-                    pc.apply_to_slot(seq.slot_idx)
-                    prefill_offsets[i] = pc.prefix_len
-                    suffix_token_ids[i] = seq.prompt_token_ids[pc.prefix_len:]
-                    self._prefix_hits += 1
-                    log.debug(
-                        "prefix_cache hit: seq=%s slot=%d prefix_len=%d suffix_len=%d",
-                        seq.request_id, seq.slot_idx, pc.prefix_len, len(suffix_token_ids[i]),
-                    )
-                else:
-                    self._prefix_misses += 1
-
-        # --- Build decode-side inputs. ---
-        decode_slot_ids = list(decode_slot_ids_order)
-        decode_last_tokens = [s.output_token_ids[-1] for s in decode_seqs]
-        decode_cache_lengths = [s.total_len - 1 for s in decode_seqs]
-        decode_samplings = [s.sampling for s in decode_seqs]
-
-        prefill_slot_ids = [s.slot_idx for s in batch_seqs]
-        prefill_samplings = [s.sampling for s in batch_seqs]
-
-        # --- Fused forward pass. ---
-        try:
-            with time_region("scheduler.mixed_step"):
-                decode_next, prefill_first = self.runner.mixed_step(
-                    decode_slot_ids=decode_slot_ids,
-                    decode_last_tokens=decode_last_tokens,
-                    decode_cache_lengths=decode_cache_lengths,
-                    decode_samplings=decode_samplings,
-                    prefill_slot_ids=prefill_slot_ids,
-                    prefill_token_ids_list=suffix_token_ids,
-                    prefill_samplings=prefill_samplings,
-                    prefill_offsets=prefill_offsets if batch_seqs else None,
-                )
-        except Exception as e:
-            log.exception("runner.mixed_step failed (D=%d P=%d): %s", D, len(batch_seqs), e)
-            # Fail admitted prefill seqs cleanly (their slots were already
-            # allocated, so return them to the free pool).
-            for seq in batch_seqs:
-                seq.status = SequenceStatus.FAILED
-                if not seq.future.done():
-                    seq.future.set_exception(e)
-                self.free_slots.append(seq.slot_idx)
-                finished.append(seq)
-            # Re-raise so the caller falls back to the legacy split path
-            # for the running decode batch on subsequent steps... but only
-            # if we'd lose decode work. If D==0, we already drained the
-            # failure above; return finished so step() doesn't double-run.
-            if D == 0:
-                return finished
-            raise
-
-        # --- Post-process decode rows. ---
-        for s, tok in zip(decode_seqs, decode_next):
-            s.append_output_token(tok)
-            if s.maybe_finish():
-                finished.append(s)
-                self._free_slot(s)
-
-        # --- Post-process freshly-prefilled rows. ---
-        if batch_seqs:
-            prefill_done_t = time.perf_counter()
-            for seq, first_token in zip(batch_seqs, prefill_first):
-                seq.append_output_token(first_token)
-                seq.prefill_done_at = prefill_done_t
-                if seq.maybe_finish():
-                    finished.append(seq)
-                    self._free_slot(seq)
-                else:
-                    seq.status = SequenceStatus.RUNNING
-                    self.running[seq.slot_idx] = seq
-            self._steps_since_prefill = 0
-        else:
-            self._steps_since_prefill += 1
-
-        metrics.record_batch(
-            running=len(self.running),
-            waiting=len(self.waiting),
-            batch_size=max(1, len(self.running)),
-        )
-        return finished
 
     def _free_slot(self, seq: Sequence) -> None:
         slot_id = seq.slot_idx
