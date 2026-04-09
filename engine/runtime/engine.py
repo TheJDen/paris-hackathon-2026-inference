@@ -152,6 +152,7 @@ class Engine:
                 self.model_name,
                 device=self.device,
                 attn_impl=self.attn_impl,
+                tp=self.tp,
             )
         self._loaded = loaded
 
@@ -169,7 +170,6 @@ class Engine:
                 num_slots=self.max_batch,
                 max_seq_len=self.max_model_len,
                 enable_cuda_graphs=self._enable_cuda_graphs,
-                compile=self._torch_compile,
             )
             log.info(
                 "model runner ready: cache_mem=%.2f GB", self.runner.cache_memory_gb()
