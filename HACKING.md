@@ -141,11 +141,17 @@ uv pip install -e ".[engine]" hf_transfer accelerate flash-linear-attention
    `uv python install 3.12` so headers come along.
 2. **`accelerate` is required** for HF `from_pretrained(device_map=...)`.
    Plain `pip install accelerate` works.
-3. **`causal-conv1d`** wants to build a CUDA extension and the build
-   environment pulls in a different torch (cu128) which mismatches the
-   installed cu130. Use `--no-build-isolation` and `MAX_JOBS=16`. We
-   currently run **without** causal-conv1d — fla still works, the conv
-   path falls back to PyTorch which is fine for Phase 1.
+3. **`causal-conv1d`** wants to build a CUDA extension and the default
+   uv build env pulls in a torch wheel built against cu128 which then
+   refuses to compile against the cu130 toolchain. The fix is
+   `--no-build-isolation` so the build sees our installed cu130 torch:
+   ```bash
+   CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=16 \
+     uv pip install --no-build-isolation causal-conv1d
+   ```
+   The build takes ~9 minutes (it compiles for many sm targets even with
+   `TORCH_CUDA_ARCH_LIST` set — setup.py overrides). Already installed
+   on the box.
 4. **`fla` 0.4.2** needs the Python.h fix above. Once that's in, it
    detects CUDA + Hopper correctly and the DeltaNet layers stop running
    on the slow torch fallback.
