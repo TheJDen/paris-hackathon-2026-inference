@@ -1,0 +1,47 @@
+# cloudbench NON-SECRET provider config. Gitignored (account-identifying ids),
+# but contains NO credentials — those live in .env. Same KEY=value format.
+#
+# Precedence: this file < .env < inline env vars.
+# Anything left blank can be filled by discovery (Claude can run the lookups
+# once the provider CLIs are authed; Sesterce can be discovered via its API).
+
+# Shared SSH key used to reach provisioned instances (fallback for all providers).
+# SSH_KEY_PATH=~/.ssh/id_ed25519
+
+# --------------------------------------------------------------------------- #
+# Sesterce (default for frequent 1xH200 iteration)
+# Fill instance types / region / cloud / os from:
+#   curl -H "X-API-KEY: $KEY" -H "User-Agent: cloudbench" \
+#     "https://api.cloud.sesterce.com/gpu-cloud/instances/offers?gpuType=H200"
+# (cloud._id -> SESTERCE_CLOUD_PROVIDER, instanceId -> type, configuration.os ->
+#  SESTERCE_OS, availability[].region -> SESTERCE_REGION)
+# --------------------------------------------------------------------------- #
+SESTERCE_BASE_URL=https://api.cloud.sesterce.com
+SESTERCE_CLOUD_PROVIDER=
+SESTERCE_REGION=
+SESTERCE_OS=
+SESTERCE_INSTANCE_TYPE_H200=
+SESTERCE_INSTANCE_TYPE_H200_8X=
+# SESTERCE_SSH_KEY_ID=
+# SESTERCE_SSH_KEY_PATH=~/.ssh/id_ed25519
+
+# --------------------------------------------------------------------------- #
+# Nebius (1xH200 sanity checks + 8xH200 distributed)
+# --------------------------------------------------------------------------- #
+NEBIUS_PROJECT_ID=
+NEBIUS_REGION=
+NEBIUS_SUBNET_ID=
+NEBIUS_IMAGE_ID=
+NEBIUS_PLATFORM_ID_H200=
+NEBIUS_PLATFORM_ID_H200_8X=
+# NEBIUS_FILESYSTEM_ID=
+# NEBIUS_GPU_CLUSTER_ID=
+# NEBIUS_SSH_KEY=~/.ssh/id_ed25519
+# NEBIUS_SSH_USER=ubuntu
+# NEBIUS_BIN=nebius
+
+# --------------------------------------------------------------------------- #
+# Modal (smoke tests only)
+# --------------------------------------------------------------------------- #
+# MODAL_REGION=
+# MODAL_BIN=modal

@@ -15,11 +15,22 @@ dependencies = [
 
 [project.optional-dependencies]
 baseline = ["vllm>=0.8"]
+# cloudbench is a zero-dependency control plane (pure stdlib). PyYAML is purely
+# optional — it gives nicer YAML parsing; without it a stdlib fallback is used.
+# Kept OUT of [project.dependencies] so orchestrating cloud runs never drags in
+# the heavy ML stack, and vice versa.
+cloudbench = ["pyyaml>=6"]
+
+# Dev-only tooling (PEP 735 dependency group). Installed via `uv sync --group dev`
+# or `uv run --group dev ...`; never shipped as a project dependency.
+[dependency-groups]
+dev = ["pytest>=8", "pyyaml>=6"]
 
 [tool.setuptools.packages.find]
-include = ["eval*"]
+include = ["eval*", "cloudbench*"]
 
 [project.scripts]
 check-server = "eval.check_server:main"
 run-correctness = "eval.correctness.run_correctness:main"
 run-throughput = "eval.throughput.run_throughput:main"
+cloudbench = "cloudbench.cli:main"

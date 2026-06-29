@@ -12,6 +12,10 @@ wheels/
 # Egg info
 *.egg-info
 
+# Secrets / local cloudbench config (never commit credentials or account ids)
+.env
+configs/providers.conf
+
 # Results (generated, not committed)
 results/
 

@@ -1,0 +1,53 @@
+# Benchmark registry.
+#
+# BENCH selects WHAT to run; PROVIDER (chosen on the CLI / Makefile) selects
+# WHERE to run it. Override any command at runtime with BENCH_CMD or --bench-cmd.
+#
+# Fields:
+#   command          shell command run in the repo root (remote or local)
+#   gpu              GPU type ("none" for CPU-only)
+#   ngpus            number of GPUs (0 = CPU)
+#   timeout_minutes  hard wall-clock limit
+#   description      human-readable summary
+
+smoke:
+  command: python -m pytest -q tests/test_smoke.py
+  gpu: none
+  ngpus: 0
+  timeout_minutes: 10
+  description: Fast CPU/local correctness smoke test.
+
+decode_smoke:
+  command: python bench_decode.py --tokens 64 --batch-size 4
+  gpu: H200
+  ngpus: 1
+  timeout_minutes: 10
+  description: Tiny decode benchmark to verify the cloud path works.
+
+gpu_smoke:
+  command: python scripts/fake_bench.py --size 4096 --iters 50
+  gpu: T4
+  ngpus: 1
+  timeout_minutes: 15
+  description: Tiny real torch matmul (TFLOPS). Cheap GPU smoke (T4 on Modal).
+
+single_h200_decode:
+  command: python bench_decode.py --tokens 1024 --batch-size 64
+  gpu: H200
+  ngpus: 1
+  timeout_minutes: 60
+  description: Main single-H200 decode iteration benchmark.
+
+single_h200_prefill:
+  command: python bench_prefill.py --seq-len 4096 --batch-size 8
+  gpu: H200
+  ngpus: 1
+  timeout_minutes: 60
+  description: Main single-H200 prefill benchmark.
+
+e2e_8xh200:
+  command: torchrun --nproc_per_node=8 serve_bench.py --requests 512
+  gpu: H200
+  ngpus: 8
+  timeout_minutes: 120
+  description: Full 8xH200 distributed end-to-end benchmark.
