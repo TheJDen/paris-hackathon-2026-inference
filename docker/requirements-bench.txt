@@ -2,3 +2,4 @@
 # image — see docker/Dockerfile). Add your inference-engine / bench deps here,
 # then: make docker-build && make docker-push
 numpy
+vllm>=0.8

@@ -189,7 +189,9 @@ def wrap_command_for_profile(
         prefix = (f"nsys profile --force-overwrite true -o {out_base}_nsys "
                   f"--trace=cuda,nvtx,cublas,cudnn,osrt")
     else:  # ncu  -> artifacts/<name>_ncu.ncu-rep
-        prefix = f"ncu --set full -f -o {out_base}_ncu"
+        # Default to ncu's light section set (fast). Add e.g.
+        # PROFILE_ARGS="--set full" or "--launch-count N" for heavier/scoped runs.
+        prefix = f"ncu -f -o {out_base}_ncu"
     if profile_args:
         prefix += " " + profile_args
     return f"{prefix} {command}"

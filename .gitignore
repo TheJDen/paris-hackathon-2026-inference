@@ -19,6 +19,10 @@ configs/providers.conf
 # Results (generated, not committed)
 results/
 
+# Per-run bench outputs written into the repo root/CWD by local runs
+/benchmark_result.json
+/artifacts/
+
 # Raw lm-eval output (large, keep only summary JSONs)
 baseline/results/correctness_raw/
 

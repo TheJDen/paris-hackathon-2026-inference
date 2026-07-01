@@ -31,6 +31,13 @@ gpu_smoke:
   timeout_minutes: 15
   description: Tiny real torch matmul (TFLOPS). Cheap GPU smoke (T4 on Modal).
 
+vllm_local_smoke:
+  command: python bench_decode.py --model Qwen/Qwen2.5-0.5B-Instruct --tokens 128 --batch-size 32
+  gpu: GB10
+  ngpus: 1
+  timeout_minutes: 20
+  description: vLLM offline decode throughput, tiny model. Local GB10 smoke.
+
 single_h200_decode:
   command: python bench_decode.py --tokens 1024 --batch-size 64
   gpu: H200
