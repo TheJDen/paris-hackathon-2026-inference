@@ -14,7 +14,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# vLLM is the REFERENCE engine only (baseline numbers to beat) — never a
+# dependency of our own engine.
 baseline = ["vllm>=0.8"]
+
+# Our own inference engine's runtime deps. Platform-neutral: `torch` is
+# deliberately absent because it's provided per-platform (the x86 CUDA pytorch
+# base image on the 8xH200 scoring box; a cu130 arm64 wheel on the local GB10
+# dev box). Install with `uv pip install -e ".[engine]"` into whichever env
+# already has the right torch.
+engine = [
+    "fastapi",
+    "uvicorn[standard]",
+    "transformers>=4.45",
+    "accelerate",
+    "pydantic>=2",
+]
+
 # cloudbench is a zero-dependency control plane (pure stdlib). PyYAML is purely
 # optional — it gives nicer YAML parsing; without it a stdlib fallback is used.
 # Kept OUT of [project.dependencies] so orchestrating cloud runs never drags in
@@ -27,7 +43,7 @@ cloudbench = ["pyyaml>=6"]
 dev = ["pytest>=8", "pyyaml>=6"]
 
 [tool.setuptools.packages.find]
-include = ["eval*", "cloudbench*"]
+include = ["eval*", "cloudbench*", "engine*"]
 
 [project.scripts]
 check-server = "eval.check_server:main"
