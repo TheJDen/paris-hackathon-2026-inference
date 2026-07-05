@@ -19,6 +19,24 @@ wheels = [
 ]
 
 [[package]]
+name = "accelerate"
+version = "1.14.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/75/94cd5d389649578aca399e5aa822637eec18319a1dadc400ffe2f9a7493f/accelerate-1.14.0.tar.gz", hash = "sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d", size = 412167, upload-time = "2026-06-11T13:45:52.326Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/db/253133d7e7cb40d3af384bb2f5c0b4a2b7fdcffbc95c688cc67a20a3c103/accelerate-1.14.0-py3-none-any.whl", hash = "sha256:e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6", size = 389246, upload-time = "2026-06-11T13:45:50.477Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1133,6 +1151,13 @@ baseline = [
 cloudbench = [
     { name = "pyyaml" },
 ]
+engine = [
+    { name = "accelerate" },
+    { name = "fastapi" },
+    { name = "pydantic" },
+    { name = "transformers" },
+    { name = "uvicorn", extra = ["standard"] },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1142,16 +1167,21 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", marker = "extra == 'engine'" },
     { name = "aiohttp", specifier = ">=3.9" },
+    { name = "fastapi", marker = "extra == 'engine'" },
     { name = "lm-eval", extras = ["api"], specifier = ">=0.4.4" },
     { name = "numpy" },
+    { name = "pydantic", marker = "extra == 'engine'", specifier = ">=2" },
     { name = "pyyaml", marker = "extra == 'cloudbench'", specifier = ">=6" },
     { name = "tabulate" },
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.45" },
+    { name = "transformers", marker = "extra == 'engine'", specifier = ">=4.45" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'engine'" },
     { name = "vllm", marker = "extra == 'baseline'", specifier = ">=0.8" },
 ]
-provides-extras = ["baseline", "cloudbench"]
+provides-extras = ["baseline", "engine", "cloudbench"]
 
 [package.metadata.requires-dev]
 dev = [

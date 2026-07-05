@@ -112,25 +112,26 @@ class Client:
         finished = []
         with torch.profiler.record_function(f"infer[n={len(batch)}]"):
             for item in batch:
-                with torch.profiler.record_function("tokenize"):
-                    input_ids = self.tokenizer.apply_chat_template(
-                            item.req.messages,
-                            add_generation_prompt=True,
-                            enable_thinking=False,
-                            return_tensors="pt"
-                    ).input_ids.to(device=self.model.device)
+                input_ids = self.tokenizer.apply_chat_template(
+                        item.req.messages,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                        return_tensors="pt"
+                        ).input_ids.to(device=self.model.device)
                 seq = input_ids
-                finish_reason = "length"                 # hit the token budget unless we break out
-                for _ in range(item.req.max_tokens):
-                    with torch.inference_mode():
-                        with torch.profiler.record_function("forward"):
-                            logits = self.model(seq, use_cache=False).logits
+                with torch.inference_mode():
+                    finish_reason = "length"                 # hit the token budget unless we break out
+                    with torch.profiler.record_function("prefill"):
+                        out = self.model(seq, use_cache=True)
+                    for _ in range(item.req.max_tokens):
                         with torch.profiler.record_function("sample"):
-                            next_id = sample_next(logits[:, -1, :], temperature=item.req.temperature, top_p=item.req.top_p)
+                            next_id = sample_next(out.logits[:, -1, :], temperature=item.req.temperature, top_p=item.req.top_p)
                             if next_id.item() in stop_ids:
                                 finish_reason = "stop"
                                 break
                         seq = torch.cat([seq, next_id], dim=1)
+                        with torch.profiler.record_function("forward"):
+                            out = self.model(next_id, past_key_values=out.past_key_values, use_cache=True)
                 gen_ids = seq[0, input_ids.shape[1]:]
                 text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
@@ -195,7 +196,9 @@ class Client:
         cfg = transformers.AutoConfig.from_pretrained(model_dir)
         cls = getattr(transformers, cfg.architectures[0])   # Qwen3_5MoeForConditionalGeneration
         with torch.device("cuda"):
-            self.model = cls._from_config(cfg, dtype=torch.bfloat16)
+            attn_impl = "flash_attention_2" if transformers.utils.import_utils.is_flash_attn_2_available else "sdpa" 
+            print(f"attn_impl: {attn_impl}")
+            self.model = cls._from_config(cfg, dtype=torch.bfloat16, attn_implementation=attn_impl)
         self.model.eval()
 
         idx = os.path.join(model_dir, "model.safetensors.index.json")

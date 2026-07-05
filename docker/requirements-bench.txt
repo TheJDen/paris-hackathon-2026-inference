@@ -1,5 +1,12 @@
-# Extra Python deps for your benchmarks (torch + CUDA are already in the base
-# image — see docker/Dockerfile). Add your inference-engine / bench deps here,
-# then: make docker-build && make docker-push
-numpy
-vllm>=0.8
+# Python deps for OUR inference engine (NOT the vLLM baseline).
+# torch + CUDA come from the base image (see docker/Dockerfile); everything here
+# installs on top. The fast kernels (FLA / causal_conv1d / flash-attn) are NOT
+# here — they need sequenced install steps + build gotchas, so they live in the
+# Dockerfile RUN layers.
+fastapi
+uvicorn[standard]
+transformers>=5.12
+pydantic>=2
+huggingface_hub
+safetensors
+einops

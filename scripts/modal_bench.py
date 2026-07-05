@@ -50,19 +50,40 @@ def _gpu_spec():
     return f"{CB_GPU}:{CB_NGPUS}"
 
 
-# Adjust this image to match your benchmark's dependencies.
+# Engine image: CUDA devel base (has nvcc to build kernels) + engine deps + the
+# fast kernels. Modal builds this once and caches it. See engine-kernel-deps notes
+# for the gotchas baked in here (FLA from git; uninstall `kernels` after building
+# causal_conv1d or it breaks the transformers import).
 IMAGE = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy", "tqdm", "torch")  # torch (CUDA build) for GPU benches
+    # 2.7 base bundles a recent Triton (has Autotuner `do_bench`) that FLA git-main
+    # requires; 2.5.1's Triton 3.1 was too old and crashed FLA on import.
+    modal.Image.from_registry("pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel")
+    .apt_install("git", "build-essential", "ninja-build", "curl")
+    .pip_install(
+        "fastapi", "uvicorn[standard]", "transformers>=5.12", "pydantic>=2",
+        "huggingface_hub", "safetensors", "einops",
+    )
+    .run_commands(
+        "pip install --no-deps git+https://github.com/fla-org/flash-linear-attention",
+        "pip install --no-build-isolation flash-attn",
+        "pip install kernels && pip install --no-build-isolation causal_conv1d "
+        "&& pip uninstall -y kernels kernels-data",
+    )
+    .env({"HF_HOME": "/models"})  # point the HF cache at the mounted Volume
     .add_local_dir(".", remote_path="/workspace", ignore=[
         ".git", ".venv", "results", "__pycache__", "*.pyc",
     ])
 )
 
+# Persistent cache for the ~70GB model — survives across runs and won't fit in the
+# function's ephemeral disk.
+HF_CACHE = modal.Volume.from_name("paris-hf-cache", create_if_missing=True)
+
 app = modal.App(CB_APP_NAME)
 
 
-@app.function(gpu=_gpu_spec(), timeout=CB_TIMEOUT, image=IMAGE)
+@app.function(gpu=_gpu_spec(), timeout=CB_TIMEOUT, image=IMAGE,
+              volumes={"/models": HF_CACHE})
 def run_bench(command: str) -> dict:
     """Run the benchmark command inside the Modal container and capture output."""
     os.makedirs(f"/workspace/{CB_ARTIFACTS_DIR}", exist_ok=True)

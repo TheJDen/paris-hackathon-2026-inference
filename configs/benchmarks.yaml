@@ -24,6 +24,20 @@ decode_smoke:
   timeout_minutes: 10
   description: Tiny decode benchmark to verify the cloud path works.
 
+engine_smoke:
+  command: bash scripts/engine_cloud_smoke.sh
+  gpu: H200
+  ngpus: 1
+  timeout_minutes: 60
+  description: OUR engine on 1xH200 (rsync) — install stack, load 35B, verify correct output.
+
+engine_smoke_modal:
+  command: bash scripts/engine_smoke_modal.sh
+  gpu: H200
+  ngpus: 1
+  timeout_minutes: 60
+  description: OUR engine on Modal 1xH200 — deps baked in image, load 35B, verify correct output.
+
 gpu_smoke:
   command: python scripts/fake_bench.py --size 4096 --iters 50
   gpu: T4
