@@ -73,28 +73,23 @@ class Scheduler:
 
     def infer(self, items: list[WorkItem]):
         requests = [item.req for item in items]
-        batcher = engine.batching.StaticBatcher(
-                self.model,
-                self.tokenizer,
-                self.stop_ids,
-                requests
-                )
+        batcher = engine.batching.StaticBatcher(self.model_bundle, requests)
         n = num_active = len(items)
         cum_active = 0
-        finsish_steps = []
+        finish_steps = []
         step = 0
         while not batcher.is_done():
             completions_by_id = batcher.step()
             step += 1
             num_active -= len(completions_by_id)
             cum_active += num_active
-            finsish_steps.extend([step] * len(completions_by_id))
+            finish_steps.extend([step] * len(completions_by_id))
             yield from (self.deliver(items[i], completion) for i, completion in completions_by_id.items())
 
         if self._debug and step:
             eff_batch = cum_active / step
             print(f"[util] steps={step} eff_batch={eff_batch:.1f} occ={eff_batch / n}")
-            print(f"[finish step] p50={statistics.median(finsish_steps)}")
+            print(f"[finish step] p50={statistics.median(finish_steps)}")
             
 
 
@@ -126,7 +121,7 @@ class Scheduler:
         return batch
 
     def _engine_main(self):
-        self.model, self.tokenizer, self.stop_ids = self.load_fn()
+        self.model_bundle = self.load_fn()
         self._warmup()
         self.ready = True
 
@@ -160,7 +155,7 @@ class Scheduler:
                 messages=[{"role": "user", "content": "hi"}], max_tokens=2)
                     for _ in range(n)]
             with torch.inference_mode():
-                batcher = engine.batching.StaticBatcher(self.model, self.tokenizer, self.stop_ids, reqs)
+                batcher = engine.batching.StaticBatcher(self.model_bundle, reqs)
                 for _ in range(2):
                     batcher.step()
 

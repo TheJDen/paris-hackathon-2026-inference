@@ -21,6 +21,12 @@ class Completion:
     completion_tokens: int
     finish_reason: str
 
+@dataclasses.dataclass
+class ModelBundle:
+    model: transformers.Qwen3_5MoeForCausalLM
+    tokenizer: transformers.PreTrainedTokenizerFast
+    stop_ids: set
+
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 
 def sample_next(logits, temperature, top_p):
@@ -42,41 +48,47 @@ def sample_next(logits, temperature, top_p):
     greedy_tok = torch.argmax(logits, dim=-1, keepdim=True)
     return torch.where(greedy, greedy_tok, sampled)
 
-def load(model_id: str = MODEL_ID):
+def load(model_id: str = MODEL_ID) -> ModelBundle:
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model_dir = huggingface_hub.snapshot_download(model_id)
-    cfg = transformers.AutoConfig.from_pretrained(model_dir)
-    arch = getattr(transformers, cfg.architectures[0])   # Qwen3_5MoeForConditionalGeneration
+    tcfg = transformers.AutoConfig.from_pretrained(model_dir).get_text_config()
+    arch = transformers.Qwen3_5MoeForCausalLM
     with torch.device("cuda"):
         attn_impl = "flash_attention_2" if transformers.utils.import_utils.is_flash_attn_2_available() else "sdpa" 
         print(f"attn_impl: {attn_impl}")
-        model = arch._from_config(cfg, dtype=torch.bfloat16, attn_implementation=attn_impl)
+        model = arch._from_config(tcfg, dtype=torch.bfloat16, attn_implementation=attn_impl)
     model.eval()
 
     _load_weights(model, model_dir)
 
     stop_ids = {tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|im_end|>")}
-    return model, tokenizer, stop_ids
+    return ModelBundle(model, tokenizer, stop_ids)
 
 def _load_weights(model, model_dir):
     idx = os.path.join(model_dir, "model.safetensors.index.json")
     weight_map = json.load(open(idx))["weight_map"]
     shards = sorted(set(weight_map.values()))
 
-    gpu_tensors = dict(model.state_dict())
-    loaded_names = set()
-    with tqdm.tqdm(total=len(gpu_tensors), desc="Loading weights", unit="tensor") as pbar:
-        for shard in shards:
-            with safetensors.safe_open(os.path.join(model_dir, shard), framework="pt", device="cuda") as f:
-                for name in f.keys():
-                    if name not in gpu_tensors:
-                        continue
-                    gpu_tensors[name].data.copy_(f.get_tensor(name))
-                    loaded_names.add(name)
-                    pbar.update(1)
-            pbar.set_postfix_str(shard[-25:])
-    missing_names = set(gpu_tensors) - loaded_names 
-    assert not missing_names, f"never filled {missing_names}"
+    main_tensors = dict(model.state_dict())
+    loaded_main = set()
+    mtp_tensors = {}
+    for shard in tqdm.tqdm(shards, desc="Loading shards..."):
+        with safetensors.safe_open(os.path.join(model_dir, shard), framework="pt", device="cuda") as f:
+            for name in f.keys():
+                main_key = _main_key(name)
+                if main_key is not None:
+                    main_tensors[main_key].data.copy_(f.get_tensor(name))
+                    loaded_main.add(main_key)
+    missing_main = set(main_tensors) - loaded_main
+    assert not missing_main, f"never filled {missing_main}"
+    return mtp_tensors
+
+def _main_key(name: str):
+    if name == "lm_head.weight":
+        return name
+    elif name.startswith("model.language_model."):
+        return name.replace(".language_model", "")
+    return None
