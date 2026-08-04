@@ -23,6 +23,7 @@ class SlotCache:
         self.conv = {l: torch.empty(num_slots, conv_dim, conv_width, dtype=torch.bfloat16, device=device) for l in gdn}
         self.lens = torch.zeros(num_slots, dtype=torch.int32, device=device)
         self.free = list(range(num_slots))
+        self.capacity = num_slots
 
     def read_gdn(self, layer_idx, slots):
         return self.conv[layer_idx][slots], self.rec[layer_idx][slots]
@@ -40,3 +41,6 @@ class SlotCache:
 
     def num_free_slots(self) -> int:
         return len(self.free)
+
+    def advance(self, slots, n):
+        self.lens[slots] += n

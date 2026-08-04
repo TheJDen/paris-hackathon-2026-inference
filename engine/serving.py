@@ -1,6 +1,6 @@
 import asyncio
-import engine.model
-import engine.scheduling
+import engine.engine
+import engine.records
 import fastapi
 import pydantic
 import queue
@@ -42,25 +42,25 @@ class ChatCompletionResponse(pydantic.BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
-    scheduler = engine.scheduling.Scheduler()
-    scheduler.start()
-    app.state.scheduler = scheduler
+    async_engine = engine.engine.AsyncEngine()
+    async_engine.start()
+    app.state.async_engine = async_engine
     yield
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health(request: fastapi.Request):
-    scheduler: engine.scheduling.Scheduler = request.app.state.scheduler
-    if not scheduler.ready:
+    async_engine: engine.engine.AsyncEngine = request.app.state.async_engine
+    if not async_engine.ready:
         return fastapi.Response(status_code=503)
     return fastapi.Response(status_code=200)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: fastapi.Request):
-    scheduler: engine.scheduling.Scheduler = request.app.state.scheduler
+    async_engine: engine.engine.AsyncEngine = request.app.state.async_engine
 
-    cc_req = engine.model.CompletionRequest(
+    cc_req = engine.records.CompletionRequest(
             messages = [m.model_dump() for m in req.messages],
             max_tokens = req.max_tokens,
             temperature = req.temperature,
@@ -68,15 +68,12 @@ async def chat_completions(req: ChatCompletionRequest, request: fastapi.Request)
     )
 
     try:
-        request_id, future = scheduler.submit(cc_req)
+        completion = await asyncio.wait_for(async_engine.generate(cc_req), timeout=600)
     except queue.Full:
         raise fastapi.HTTPException(
                 status_code=503,
                 detail="Engine queue full"
                 )
-
-    try:
-        result = await asyncio.wait_for(future, timeout=600)
     except asyncio.TimeoutError:
         raise fastapi.HTTPException(
                 status_code=504,
@@ -89,23 +86,27 @@ async def chat_completions(req: ChatCompletionRequest, request: fastapi.Request)
                 )
 
     return ChatCompletionResponse(
-        id=f"chatcmpl-{result['request_id']}",
+        id=f"chatcmpl-{completion.request_id}",
         model=req.model,
         created=int(time.time()),
         choices=[
             Choice(
                 index=0,
-                message=ChatMessage(role="assistant", content=result["text"]),
-                finish_reason=result["finish_reason"],
+                message=ChatMessage(role="assistant", content=completion.text),
+                finish_reason=completion.finish_reason,
             )
         ],
-        usage=Usage(**result["usage"]),
+        usage=Usage(
+            prompt_tokens=completion.prompt_tokens,
+            completion_tokens=completion.completion_tokens,
+            total_tokens=completion.prompt_tokens + completion.completion_tokens
+        ),
     )
 
 @app.post("/start_profile")
 def start_profile(request: fastapi.Request):
     try:
-        request.app.state.scheduler.queue_start_profile()
+        request.app.state.async_engine.queue_start_profile()
     except queue.Full:
         raise fastapi.HTTPException(503, "engine queue full; retry")
     except RuntimeError as e:
@@ -116,7 +117,7 @@ def start_profile(request: fastapi.Request):
 @app.post("/stop_profile")
 def stop_profile(request: fastapi.Request):
     try:
-        request.app.state.scheduler.queue_stop_profile()
+        request.app.state.async_engine.queue_stop_profile()
     except queue.Full:
           raise fastapi.HTTPException(503, "engine queue full; retry")
     except RuntimeError as e:

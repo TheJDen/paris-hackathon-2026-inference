@@ -18,7 +18,7 @@ print("ENV OK -> fla:", a(), "causal_conv1d:", b(), "flash_attn2:", c())
 PY
 
 echo "[smoke] starting server (downloads 35B to /models on first run)"
-python -m uvicorn engine.server:app --host 0.0.0.0 --port "$PORT" > /tmp/server.log 2>&1 &
+python -m uvicorn engine.serving:app --host 0.0.0.0 --port "$PORT" > /tmp/server.log 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true' EXIT
 
