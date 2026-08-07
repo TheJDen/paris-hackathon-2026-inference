@@ -21,7 +21,7 @@ decode_smoke:
   command: python bench_decode.py --tokens 64 --batch-size 4
   gpu: H200
   ngpus: 1
-  timeout_minutes: 10
+  timeout_minutes: 60  # was 10; a cold torch-2.8 image build (flash-attn source compile) needs headroom. Cached after first build.
   description: Tiny decode benchmark to verify the cloud path works.
 
 engine_smoke:

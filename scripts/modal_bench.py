@@ -42,6 +42,32 @@ CB_ARTIFACTS_DIR = os.environ.get("CB_ARTIFACTS_DIR", "artifacts")
 CB_ARTIFACTS_MAX_MB = int(os.environ.get("CB_ARTIFACTS_MAX_MB", "64"))
 
 
+def _source_dir() -> str:
+    """What add_local_dir ships to /workspace.
+
+    Default: the working tree (".") — good for iterating on uncommitted WIP.
+    CB_SHIP_COMMIT=1: a clean export of the current git commit (HEAD), so bench-cloud
+    validates COMMITTED code, not uncommitted WIP. (add_local_dir copies from disk, so
+    WIP otherwise leaks in — which is how a half-written edit once broke the smoke.)
+    The uncommitted smoke script is overlaid on the export so diagnostics stay good while
+    the *engine* under test is exactly the commit.
+    """
+    if not os.environ.get("CB_SHIP_COMMIT"):
+        return "."
+    export = "/tmp/cb-commit-export"
+    subprocess.run(
+        f"rm -rf {export} && mkdir -p {export} && git archive HEAD | tar -x -C {export}",
+        shell=True, check=True)
+    subprocess.run(
+        f"cp scripts/engine_smoke_modal.sh {export}/scripts/engine_smoke_modal.sh",
+        shell=True, check=True)
+    print(f"[modal] CB_SHIP_COMMIT=1 — shipping git HEAD from {export}", flush=True)
+    return export
+
+
+SOURCE_DIR = _source_dir()
+
+
 def _gpu_spec():
     if CB_NGPUS <= 0 or CB_GPU.lower() in ("", "none"):
         return None
@@ -55,22 +81,38 @@ def _gpu_spec():
 # for the gotchas baked in here (FLA from git; uninstall `kernels` after building
 # causal_conv1d or it breaks the transformers import).
 IMAGE = (
-    # 2.7 base bundles a recent Triton (has Autotuner `do_bench`) that FLA git-main
-    # requires; 2.5.1's Triton 3.1 was too old and crashed FLA on import.
-    modal.Image.from_registry("pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel")
-    .apt_install("git", "build-essential", "ninja-build", "curl")
-    .pip_install(
-        "fastapi", "uvicorn[standard]", "transformers>=5.12", "pydantic>=2",
-        "huggingface_hub", "safetensors", "einops",
+    # torch 2.8 ships Triton 3.4 = where `tl.make_tensor_descriptor` (modern TMA API)
+    # became stable — the reason for the bump. Its base image is Python 3.11 (mature
+    # wheels). NB: do NOT use 2.10 here — that base ships Python 3.14, and Modal's own
+    # pinned aiohttp has a stale Cython `_websocket.c` referencing the removed
+    # `ob_digit` CPython internal, so its client-deps step fails to compile a wheel.
+    modal.Image.from_registry(
+        "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel",
+        # Modal auto-injects its own client bootstrap (`COPY modal_requirements.txt`
+        # + `pip install --upgrade pip`) right after FROM, BEFORE any of our layers.
+        # If the base's Python is PEP-668 externally-managed, that injected pip fails —
+        # and our .env below can't help a step that runs before it. setup_dockerfile_commands
+        # run FIRST (before Modal's bootstrap), so strip the EXTERNALLY-MANAGED marker here.
+        setup_dockerfile_commands=[
+            "RUN find / -name EXTERNALLY-MANAGED -delete 2>/dev/null || true",
+        ],
     )
+    .env({"PIP_BREAK_SYSTEM_PACKAGES": "1"})  # belt-and-suspenders for our own pips
+    .apt_install("git", "build-essential", "ninja-build", "curl")
+    # NB: all pip via run_commands (not .pip_install) — the latter injects an
+    # `upgrade pip` step that ignores PIP_BREAK_SYSTEM_PACKAGES and fails on PEP-668.
     .run_commands(
-        "pip install --no-deps git+https://github.com/fla-org/flash-linear-attention",
-        "pip install --no-build-isolation flash-attn",
-        "pip install kernels && pip install --no-build-isolation causal_conv1d "
+        "pip install --break-system-packages fastapi 'uvicorn[standard]' "
+        "'transformers>=5.12' 'pydantic>=2' huggingface_hub safetensors einops",
+        "pip install --break-system-packages --no-deps "
+        "git+https://github.com/fla-org/flash-linear-attention",
+        "pip install --break-system-packages --no-build-isolation flash-attn",
+        "pip install --break-system-packages kernels "
+        "&& pip install --break-system-packages --no-build-isolation causal_conv1d "
         "&& pip uninstall -y kernels kernels-data",
     )
     .env({"HF_HOME": "/models"})  # point the HF cache at the mounted Volume
-    .add_local_dir(".", remote_path="/workspace", ignore=[
+    .add_local_dir(SOURCE_DIR, remote_path="/workspace", ignore=[
         ".git", ".venv", "results", "__pycache__", "*.pyc",
     ])
 )

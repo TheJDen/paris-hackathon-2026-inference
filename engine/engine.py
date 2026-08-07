@@ -2,6 +2,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import engine.batching
 import engine.caching
+import engine.kernels.moe_experts
 import engine.loading
 import engine.model_running
 import engine.patches.attn
@@ -15,6 +16,7 @@ import time
 import torch
 import tqdm
 import transformers
+import transformers.integrations.moe
 import uuid
 
 
@@ -66,6 +68,8 @@ class AsyncEngine:
 
     def _engine_main(self):
         self.model = model = self.load_fn()
+        transformers.integrations.moe.ExpertsInterface.register("triton_grouped", engine.kernels.moe_experts.fbgemm_grouped_experts_forward)
+        self.model.config._experts_implementation = "triton_grouped"
         if self.batching_mode == "continuous":
             engine.patches.attn.patch_attention()
             engine.patches.gdn.patch_gdn()

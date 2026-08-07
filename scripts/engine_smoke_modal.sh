@@ -22,19 +22,30 @@ python -m uvicorn engine.serving:app --host 0.0.0.0 --port "$PORT" > /tmp/server
 PID=$!
 trap 'kill $PID 2>/dev/null || true' EXIT
 
-echo "[smoke] waiting for /health"
-for _ in $(seq 1 360); do
-  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/health")" = "200" ] && { echo ready; break; }
+# Always ship the full server log back as an artifact so startup/warmup is visible
+# even when it never becomes healthy (the last-30-lines tail only showed access logs).
+mkdir -p "${CB_ARTIFACTS_DIR:-artifacts}"
+save_log() { cp /tmp/server.log "${CB_ARTIFACTS_DIR:-artifacts}/server.log" 2>/dev/null || true; }
+
+echo "[smoke] waiting for /health (cap ~15 min; server load+warmup should be well under)"
+READY=0
+for _ in $(seq 1 180); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/health")" = "200" ] && { echo ready; READY=1; break; }
   sleep 5
 done
+if [ "$READY" != "1" ]; then
+  echo "SMOKE FAIL: server never became healthy — dumping startup/warmup log"
+  save_log; tail -120 /tmp/server.log; exit 1
+fi
 
 RESP=$(curl -s "http://localhost:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"What is 2+2? Reply with only the number."}],"max_tokens":16,"temperature":0}')
 echo "RESPONSE: $RESP"
 CONTENT=$(echo "$RESP" | python -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
 echo "CONTENT: [$CONTENT]"
+save_log
 if echo "$CONTENT" | grep -q "4" && ! echo "$CONTENT" | grep -qi "<think>"; then
   echo "SMOKE PASS"; exit 0
 else
-  echo "SMOKE FAIL"; tail -30 /tmp/server.log; exit 1
+  echo "SMOKE FAIL"; tail -120 /tmp/server.log; exit 1
 fi

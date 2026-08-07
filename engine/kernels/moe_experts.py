@@ -1,0 +1,52 @@
+import torch
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
+
+import engine.kernels.fbgemm_grouped_gemm
+import engine.kernels.grouped_gemm
+
+
+def grouped_experts_forward(
+    self: Qwen3_5MoeExperts,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor
+):
+    T, K = top_k_index.shape
+    flat_index = top_k_index.reshape(-1)
+    order = flat_index.argsort()
+    token_idx = torch.arange(T, device=hidden_states.device).repeat_interleave(K)
+    rows = hidden_states[token_idx[order]]
+    offs = torch.bincount(flat_index, minlength=self.num_experts).cumsum(0).int()
+    gate_and_up = engine.kernels.grouped_gemm.grouped_gemm_forward(rows, self.gate_up_proj, offs)
+    gate, up = gate_and_up.chunk(2, -1)
+    h = self.act_fn(gate) * up
+    out = engine.kernels.grouped_gemm.grouped_gemm_forward(h, self.down_proj, offs)
+    out = out * top_k_weights.reshape(-1)[order, None]
+    final = torch.zeros_like(hidden_states)
+    final.index_add_(0, token_idx[order], out)
+    return final
+
+def fbgemm_grouped_experts_forward(
+    self: Qwen3_5MoeExperts,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor
+):
+    T, K = top_k_index.shape
+    flat_index = top_k_index.reshape(-1)
+    order = flat_index.argsort()
+    token_idx = torch.arange(T, device=hidden_states.device).repeat_interleave(K)
+    rows = hidden_states[token_idx[order]]
+    m_sizes = torch.bincount(flat_index, minlength=self.num_experts)
+    gate_and_up = engine.kernels.fbgemm_grouped_gemm.grouped_gemm(rows, self.gate_up_proj.reshape(-1, self.gate_up_proj.shape[-1]), m_sizes)
+    gate, up = gate_and_up.chunk(2, -1)
+    h = self.act_fn(gate) * up * top_k_weights.reshape(-1)[order, None]
+    final = torch.zeros_like(hidden_states)
+    engine.kernels.fbgemm_grouped_gemm.grouped_gemm(
+        h,
+        self.down_proj.reshape(-1, self.down_proj.shape[-1]),
+        m_sizes,
+        _output_tensor=final,
+        _scatter_add_indices=token_idx[order]
+    )
+    return final
