@@ -93,21 +93,19 @@ class ContinuousBatcher:
 
     def _prefill(self, items: list[engine.records.WorkItem]):
         slots = [self.slotcache.alloc() for _ in range(len(items))]
-        for slot, item in zip(slots, items):
-            input_ids = item.input_ids.to(self.slotcache.lens.device)
-            logits = self.model_runner.prefill(input_ids, slot)
+        input_ids = [item.input_ids for item in items]
+        logits = self.model_runner.prefill(input_ids, slots)
+        temps = torch.tensor([item.req.temperature for item in items], device=logits.device)
+        top_p = torch.tensor([item.req.top_p for item in items], device=logits.device)
+        next_toks = engine.sampling.sample_next(logits, temperature=temps, top_p=top_p).squeeze(1).tolist()
+        for slot, item, next_tok in zip(slots, items, next_toks):
             seq = SeqState(
                 slot=slot,
                 item=item,
-                prompt_len=input_ids.shape[1], 
+                prompt_len=len(item.input_ids),
                 stop_ids=self.stop_ids,
                 max_tokens=item.req.max_tokens
             )
-            next_tok = int(engine.sampling.sample_next(
-                logits,
-                temperature=torch.tensor([item.req.temperature], device=self.slotcache.lens.device),
-                top_p=torch.tensor([item.req.top_p], device=self.slotcache.lens.device),
-            ).item())
             stop_reason = seq.advance(next_tok)
             if stop_reason is None:
                 self.active.add(seq)

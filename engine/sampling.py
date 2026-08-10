@@ -1,6 +1,11 @@
 import torch
 
-def sample_next(logits: torch.Tensor, temperature: torch.Tensor, top_p: torch.Tensor):
+
+def sample_next(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor
+) -> torch.Tensor:
     temp = temperature.view(-1, 1)
     greedy = temp == 0
     safe = torch.where(greedy, torch.ones_like(temp), temp)

@@ -1,9 +1,12 @@
-import torch
 import typing
+
+import torch
+
 from engine.records import WorkItem
 
+
 class ModelRunner(typing.Protocol):
-    def prefill(self, input_ids: torch.Tensor, slot: int) -> torch.Tensor: ...
+    def prefill(self, input_ids: list[torch.Tensor], slots: list[int]) -> torch.Tensor: ...
     def decode(self, tokens: torch.Tensor, slots: torch.Tensor) -> torch.Tensor: ...
 
 class Batcher(typing.Protocol):

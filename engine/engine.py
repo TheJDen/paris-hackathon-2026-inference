@@ -1,5 +1,17 @@
 import asyncio
+import os
+import pathlib
+import queue
+import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+import torch
+import tqdm
+import transformers
+import transformers.integrations.moe
+
 import engine.batching
 import engine.caching
 import engine.kernels.moe_experts
@@ -8,17 +20,6 @@ import engine.model_running
 import engine.patches.attn
 import engine.patches.gdn
 import engine.records
-import os
-import pathlib
-import queue
-import threading
-import time
-import torch
-import tqdm
-import transformers
-import transformers.integrations.moe
-import uuid
-
 
 MAX_CONCURRENT_ACTIVE=64
 MAX_LEN = 2560
@@ -63,7 +64,7 @@ class AsyncEngine:
             add_generation_prompt=True,
             enable_thinking=False,
             return_tensors="pt"
-        ).input_ids
+        ).input_ids[0]
 
 
     def _engine_main(self):

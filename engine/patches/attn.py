@@ -1,7 +1,13 @@
 import torch
 import transformers
-from flash_attn import flash_attn_with_kvcache
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeAttention, apply_rotary_pos_emb
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeAttention,
+    apply_rotary_pos_emb,
+)
+
+from engine.patches.prefill_index import PrefillIndex
+
 
 def _attn_forward_slotted(
     self: Qwen3_5MoeAttention,
@@ -13,6 +19,7 @@ def _attn_forward_slotted(
 ):
     slotcache = kwargs["slotcache"]
     slots: torch.Tensor = kwargs["slots"]
+    prefill_index: PrefillIndex | None = kwargs.get("prefill_index")
 
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
@@ -28,17 +35,33 @@ def _attn_forward_slotted(
 
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
+    
+    if prefill_index is None: # decode
+        attn_output = flash_attn_with_kvcache(
+            query_states,
+            slotcache.k[self.layer_idx],
+            slotcache.v[self.layer_idx],
+            key_states,
+            value_states,
+            cache_seqlens=slotcache.lens[slots],
+            cache_batch_idx=slots,
+            causal=True
+        )
+    else: # prefill
+        q = query_states.flatten(0, 1)
+        k = key_states.flatten(0, 1)
+        v = value_states.flatten(0, 1)
+        attn_output = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=prefill_index.cu_seqlens,
+            cu_seqlens_k=prefill_index.cu_seqlens,
+            max_seqlen_q=prefill_index.max_seqlen,
+            max_seqlen_k=prefill_index.max_seqlen,
+            causal=True
+        )
 
-    attn_output = flash_attn_with_kvcache( # and this
-        query_states,
-        slotcache.k[self.layer_idx],
-        slotcache.v[self.layer_idx],
-        key_states,
-        value_states,
-        cache_seqlens=slotcache.lens[slots],
-        cache_batch_idx=slots,
-        causal=True
-    )
+        slotcache.k[self.layer_idx][prefill_index.dest_slot, prefill_index.position_ids] = k
+        slotcache.v[self.layer_idx][prefill_index.dest_slot, prefill_index.position_ids] = v
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)

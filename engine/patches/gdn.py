@@ -1,7 +1,13 @@
 import torch
 import torch.nn.functional as F
 import transformers
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet, apply_mask_to_padding_states
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeGatedDeltaNet,
+    apply_mask_to_padding_states,
+)
+
+from engine.patches.prefill_index import PrefillIndex
+
 
 def _gdn_forward_slotted(
     self: Qwen3_5MoeGatedDeltaNet,
@@ -13,7 +19,7 @@ def _gdn_forward_slotted(
 
     slotcache = kwargs["slotcache"]
     slots: torch.Tensor = kwargs["slots"]
-    decoding: bool = kwargs["decoding"]
+    prefill_index: PrefillIndex | None = kwargs.get("prefill_index")
 
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -35,7 +41,7 @@ def _gdn_forward_slotted(
     a = self.in_proj_a(hidden_states)
 
 
-    if decoding:
+    if prefill_index is None:
         conv, rec = slotcache.read_gdn(self.layer_idx, slots)
         # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
         mixed_qkv = self.causal_conv1d_update(
@@ -50,14 +56,23 @@ def _gdn_forward_slotted(
         # Cached chunked-tokens decode: prepend the cached conv context so the causal conv
         # sees the correct left-context rather than zero-padding. Dropped from the output
         # at the end of this branch.
-        conv = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+        # conv = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+
+        # now that prefill is all in same dim we have to do a gather
+        K = self.conv_kernel_size
+        starts, ends = prefill_index.cu_seqlens[:-1], prefill_index.cu_seqlens[1:]
+        window = ends[:, None] - K + torch.arange(K, device=mixed_qkv.device)
+        valid = window >= starts[:, None]
+        conv = (mixed_qkv[0][:, window.clamp(min=0)] * valid)
+        conv = conv.permute(1, 0, 2).contiguous()
+
         if self.causal_conv1d_fn is not None:
             mixed_qkv = self.causal_conv1d_fn(
                 x=mixed_qkv,
                 weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                seq_idx=kwargs.get("seq_idx"),
+                seq_idx=prefill_index.seq_idx,
             )
         else:
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
@@ -84,7 +99,7 @@ def _gdn_forward_slotted(
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-    if decoding:
+    if prefill_index is None:
         core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
             query,
             key,
@@ -106,7 +121,7 @@ def _gdn_forward_slotted(
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             # The chunked FLA kernel takes a single `cu_seqlens` arg; for packed self-attention this matches q-side lengths.
-            cu_seqlens=kwargs.get("cu_seq_lens_q"),
+            cu_seqlens=prefill_index.cu_seqlens
         )
 
     slotcache.update_gdn(self.layer_idx, slots, conv, last_recurrent_state)

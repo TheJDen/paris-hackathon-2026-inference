@@ -1,5 +1,8 @@
 import torch
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeTextConfig,
+)
+
 
 class SlotCache:
     def __init__(self, cfg: Qwen3_5MoeTextConfig, num_slots, max_len, device):
@@ -42,5 +45,5 @@ class SlotCache:
     def num_free_slots(self) -> int:
         return len(self.free)
 
-    def advance(self, slots, n):
-        self.lens[slots] += n
+    def advance(self, slots: torch.Tensor, seq_lens: torch.Tensor):
+        self.lens[slots] += seq_lens
