@@ -1,6 +1,6 @@
 import asyncio
+import concurrent
 import os
-import pathlib
 import queue
 import threading
 import time
@@ -8,7 +8,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-import tqdm
 import transformers
 import transformers.integrations.moe
 
@@ -24,9 +23,6 @@ import engine.records
 MAX_CONCURRENT_ACTIVE=64
 MAX_LEN = 2560
 
-_START_PROFILER = object()
-_STOP_PROFILER = object()
-
 class AsyncEngine:
     def __init__(self, max_queue_size=1024, load_fn=engine.loading.load):
         self.inbox = queue.Queue(maxsize=max_queue_size)
@@ -36,8 +32,6 @@ class AsyncEngine:
             daemon=True
         )
         self.ready = False
-        self._profiler = None
-        self._profiler_dir = os.environ.get("ENGINE_PROFILER_DIR")
         self.load_fn = load_fn
         self.batching_mode = os.environ.get("BATCHING_MODE", "continuous")
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(engine.loading.MODEL_ID)
@@ -88,7 +82,7 @@ class AsyncEngine:
             )
         else:
             self.batcher = engine.batching.StaticBatcher(model, self.stop_ids)
-        self._warmup()
+        self.batcher.warmup()
         self.ready = True
         self._run_batches()
 
@@ -109,13 +103,21 @@ class AsyncEngine:
             first = False
             if item is None:
                 return None
-            elif item is _START_PROFILER:
-                self.start_profile()
-            elif item is _STOP_PROFILER:
-                self.stop_profile()
-            else:
-                items.append(item)
+            if isinstance(item, tuple) and item[0] == "call": # call arb fn on engine thread
+                item[1]()
+                continue
+            items.append(item)
         return items
+
+    def run_on_engine_thread(self, fn):
+        fut = concurrent.futures.Future()
+        def task():
+            try:
+                fut.set_result(fn())
+            except Exception as e:
+                fut.set_exception(e)
+        self.inbox.put_nowait(("call", task))
+        return fut.result()
 
     def _run_batches(self):
         while True:
@@ -136,26 +138,6 @@ class AsyncEngine:
         if self.thread.is_alive():
             return
         self.thread.start()
-
-    def _warmup(self):
-        for n in tqdm.tqdm([1, 2, 4, 8, 16, 32, MAX_CONCURRENT_ACTIVE], desc="Warmup shapes"):
-            self.batcher.add([self._warmup_item() for _ in range(n)])
-            while self.batcher.has_work():
-                for _ in self.batcher.step():
-                    pass
-
-    def _warmup_item(self):
-        req = engine.records.CompletionRequest(
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=2
-        )
-        return engine.records.WorkItem(
-            req=req,
-            future=None,
-            loop=None,
-            enqueue_ts=0.0,
-            input_ids=self._tokenize(req.messages)
-        )
 
     async def generate(self, req: engine.records.CompletionRequest):
         loop = asyncio.get_running_loop()
@@ -188,42 +170,3 @@ class AsyncEngine:
     def _detokenize(self, token_ids) -> tuple[str, int]:
         text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
         return text, len(self.tokenizer.encode(text, add_special_tokens=False))
-
-    def queue_start_profile(self):
-        if self._profiler_dir is None:
-            raise RuntimeError("profiling disabled; set ENGINE_PROFILER_DIR")
-        self.inbox.put_nowait(_START_PROFILER)
-
-    def start_profile(self):
-        if self._profiler is not None:
-            print("Profiler already in progress")
-            return
-        self._profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                record_shapes=False,
-                with_stack=False
-        )
-        self._profiler.start()
-
-    def queue_stop_profile(self):
-        if self._profiler_dir is None:
-            raise RuntimeError("profiling disabled; set ENGINE_PROFILER_DIR")
-        self.inbox.put_nowait(_STOP_PROFILER)
-
-    def stop_profile(self):
-        if self._profiler_dir is None:
-            print("profiling disabled; set ENGINE_PROFILER_DIR")
-            return
-        if self._profiler is None:
-            print("Profiler not running")
-            return
-        self._profiler.stop()
-        pathlib.Path(self._profiler_dir).mkdir(parents=True, exist_ok=True)
-        out = os.path.join(self._profiler_dir, f"trace-{int(time.time())}.json.gz")
-        self._profiler.export_chrome_trace(out) # view in ui.perfetto.dev / chrome://tracing
-        print(f"trace: {out}")
-        self._profiler = None
-

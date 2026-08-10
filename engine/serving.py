@@ -1,12 +1,15 @@
 import asyncio
-import engine.engine
-import engine.records
-import fastapi
-import pydantic
+import os
 import queue
 import time
-
 from contextlib import asynccontextmanager
+
+import fastapi
+import pydantic
+
+import engine.engine
+import engine.profiling
+import engine.records
 
 
 class ChatMessage(pydantic.BaseModel):
@@ -45,6 +48,11 @@ async def lifespan(app: fastapi.FastAPI):
     async_engine = engine.engine.AsyncEngine()
     async_engine.start()
     app.state.async_engine = async_engine
+    profiler_dir = os.environ.get("ENGINE_PROFILER_DIR")
+    if profiler_dir is None:
+        app.state.profiler = None
+    else:
+        app.state.profiler = engine.profiling.Profiler(profiler_dir)
     yield
 
 app = fastapi.FastAPI(lifespan=lifespan)
@@ -105,10 +113,11 @@ async def chat_completions(req: ChatCompletionRequest, request: fastapi.Request)
 
 @app.post("/start_profile")
 def start_profile(request: fastapi.Request):
+    prof = request.app.state.profiler
+    if prof is None:
+        raise fastapi.HTTPException(403, "profiling disabled; set ENGINE_PROFILER_DIR")
     try:
-        request.app.state.async_engine.queue_start_profile()
-    except queue.Full:
-        raise fastapi.HTTPException(503, "engine queue full; retry")
+        request.app.state.async_engine.run_on_engine_thread(prof.start)
     except RuntimeError as e:
         raise fastapi.HTTPException(404, str(e))
     return {"status" :"started"}
@@ -116,11 +125,15 @@ def start_profile(request: fastapi.Request):
 
 @app.post("/stop_profile")
 def stop_profile(request: fastapi.Request):
+    prof = request.app.state.profiler
+    if prof is None:
+        raise fastapi.HTTPException(403, "profiling disabled; set ENGINE_PROFILER_DIR")
     try:
-        request.app.state.async_engine.queue_stop_profile()
-    except queue.Full:
-          raise fastapi.HTTPException(503, "engine queue full; retry")
+        # this will block unless done in separate thread but wtv bc we aren't benching
+        # it might be preferable actually since it requires trace be written before request is resolved
+        # if we do move to separate thread I would need to impl async task pattern
+        out = request.app.state.async_engine.run_on_engine_thread(prof.stop)
     except RuntimeError as e:
         raise fastapi.HTTPException(404, str(e))
-    return {"status" :"stopping"}
+    return {"trace" : out}
 

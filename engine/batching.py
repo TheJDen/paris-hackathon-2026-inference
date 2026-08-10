@@ -1,10 +1,13 @@
 import collections
 import dataclasses
+
 import torch
+
 import engine.caching
+import engine.protocols
 import engine.records
 import engine.sampling
-import engine.protocols
+
 
 @dataclasses.dataclass(kw_only=True)
 class SeqState:
@@ -149,6 +152,8 @@ class ContinuousBatcher:
     def get_num_active(self) -> int:
         return len(self.active)
 
+    def warmup(self):
+        self.model_runner.warmup()
 
 class StaticBatch:
     def __init__(self, model, stop_ids, items: list[engine.records.WorkItem]):
@@ -226,6 +231,7 @@ class StaticBatch:
             self.step_idx += 1
         return completions_by_id
 
+
 class StaticBatcher:
     collect_window = 0.2
     def __init__(self, model, stop_ids):
@@ -259,4 +265,7 @@ class StaticBatcher:
 
     def get_num_active(self) -> int:
         return len(self.batch.items) if self.batch else 0
+
+    def warmup(self):
+        pass # give me a break
 

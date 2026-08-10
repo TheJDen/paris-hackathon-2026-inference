@@ -37,7 +37,10 @@ def fbgemm_grouped_experts_forward(
     order = flat_index.argsort()
     token_idx = torch.arange(T, device=hidden_states.device).repeat_interleave(K)
     rows = hidden_states[token_idx[order]]
-    m_sizes = torch.bincount(flat_index, minlength=self.num_experts)
+    # scatter add promises static shape compared to torch.bincount
+    # m_sizes = torch.bincount(flat_index, minlength=self.num_experts)
+    m_sizes = torch.zeros(self.num_experts, dtype=torch.int64, device=hidden_states.device)
+    m_sizes.scatter_add_(0, flat_index, torch.ones_like(flat_index))
     gate_and_up = engine.kernels.fbgemm_grouped_gemm.grouped_gemm(rows, self.gate_up_proj.reshape(-1, self.gate_up_proj.shape[-1]), m_sizes)
     gate, up = gate_and_up.chunk(2, -1)
     h = self.act_fn(gate) * up * top_k_weights.reshape(-1)[order, None]

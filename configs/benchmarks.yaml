@@ -35,7 +35,7 @@ engine_smoke_modal:
   command: bash scripts/engine_smoke_modal.sh
   gpu: H200
   ngpus: 1
-  timeout_minutes: 60
+  timeout_minutes: 20  # load is ~51s + warmup + short measurements; watchdog self-limits ~90s under this and returns partial artifacts, so a tight cap is safe.
   description: OUR engine on Modal 1xH200 — deps baked in image, load 35B, verify correct output.
 
 gpu_smoke:
