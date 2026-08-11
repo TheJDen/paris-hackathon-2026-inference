@@ -6,7 +6,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     apply_mask_to_padding_states,
 )
 
-from engine.patches.prefill_index import PrefillIndex
+from engine.records import PrefillInputs
 
 
 def _gdn_forward_slotted(
@@ -19,7 +19,7 @@ def _gdn_forward_slotted(
 
     slotcache = kwargs["slotcache"]
     slots: torch.Tensor = kwargs["slots"]
-    prefill_index: PrefillIndex | None = kwargs.get("prefill_index")
+    prefill_inputs: PrefillInputs | None = kwargs.get("prefill_inputs")
 
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -41,7 +41,7 @@ def _gdn_forward_slotted(
     a = self.in_proj_a(hidden_states)
 
 
-    if prefill_index is None:
+    if prefill_inputs is None:
         conv, rec = slotcache.read_gdn(self.layer_idx, slots)
         # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
         mixed_qkv = self.causal_conv1d_update(
@@ -60,7 +60,7 @@ def _gdn_forward_slotted(
 
         # now that prefill is all in same dim we have to do a gather
         K = self.conv_kernel_size
-        starts, ends = prefill_index.cu_seqlens[:-1], prefill_index.cu_seqlens[1:]
+        starts, ends = prefill_inputs.cu_seqlens[:-1], prefill_inputs.cu_seqlens[1:]
         window = ends[:, None] - K + torch.arange(K, device=mixed_qkv.device)
         valid = window >= starts[:, None]
         conv = (mixed_qkv[0][:, window.clamp(min=0)] * valid)
@@ -72,7 +72,7 @@ def _gdn_forward_slotted(
                 weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                seq_idx=prefill_index.seq_idx,
+                seq_idx=prefill_inputs.seq_idx,
             )
         else:
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
@@ -99,7 +99,7 @@ def _gdn_forward_slotted(
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-    if prefill_index is None:
+    if prefill_inputs is None:
         core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
             query,
             key,
@@ -121,7 +121,7 @@ def _gdn_forward_slotted(
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             # The chunked FLA kernel takes a single `cu_seqlens` arg; for packed self-attention this matches q-side lengths.
-            cu_seqlens=prefill_index.cu_seqlens
+            cu_seqlens=prefill_inputs.cu_seqlens
         )
 
     slotcache.update_gdn(self.layer_idx, slots, conv, last_recurrent_state)

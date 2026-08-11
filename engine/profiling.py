@@ -12,8 +12,7 @@ class Profiler:
 
     def start(self, record_shapes=False, with_stack=False):
         if self._profiler is not None:
-            print("Profiler already in progress")
-            return
+            raise RuntimeError("Profiler already in progress")
         self._profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -26,8 +25,7 @@ class Profiler:
 
     def stop(self) -> str | None:
         if self._profiler is None:
-            print("Profiler not running")
-            return None
+            raise RuntimeError("Profiler not running")
         self._profiler.stop()
         pathlib.Path(self.dir).mkdir(parents=True, exist_ok=True)
         out = os.path.join(self.dir, f"trace-{int(time.time())}.json.gz")

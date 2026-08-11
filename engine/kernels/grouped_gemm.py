@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false
 # Vendored from woct0rdho/transformers-qwen3-moe-fused (Apache-2.0)
 # https://github.com/woct0rdho/transformers-qwen3-moe-fused
 # path: qwen3_moe_fused/grouped_gemm/non_persistent/forward.py @ 10c7309
@@ -13,7 +14,12 @@ import torch
 import triton
 import triton.language as tl
 
-from engine.kernels.autotuning import get_autotune_configs, get_autotune_keys, prune_configs
+from engine.kernels.autotuning import (
+    get_autotune_configs,
+    get_autotune_keys,
+    prune_configs,
+)
+
 
 def exceeds_smem_capacity(
     num_stages: int,

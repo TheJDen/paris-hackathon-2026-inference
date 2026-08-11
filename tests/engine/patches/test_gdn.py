@@ -7,7 +7,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGated
 
 import engine.caching
 import engine.patches.gdn
-from engine.patches.prefill_index import PrefillIndex
+from engine.records import PrefillInputs
 
 device = "cuda"
 
@@ -39,29 +39,36 @@ def test_gdn(cfg, gdn, lens):
 
     NUM_SLOTS = 8
     slotcache = engine.caching.SlotCache(cfg, NUM_SLOTS, maxL + 8, device)
-    slots = torch.randperm(NUM_SLOTS)[:B].to(torch.int32).tolist()
+    slots = torch.randperm(NUM_SLOTS)[:B].to(device, torch.int32)
 
-    prefill_index = PrefillIndex.from_lens_and_slots(lens, slots, device)
+    prefill_inputs = PrefillInputs.from_tokens(
+        input_ids=[torch.zeros(l, dtype=torch.long, device=device) for l in lens],
+        temp=torch.zeros(B, device=device),
+        top_p=torch.ones(B, device=device),
+        device=device,
+    )
+    dest_slot = slots.repeat_interleave(prefill_inputs.seq_lens)
 
     x_packed_prefill = torch.cat([x[i, :l] for i, l in enumerate(lens)]).unsqueeze(0)
     b_idx = torch.arange(B, device=device)
-    x_decode = x[b_idx, prefill_index.seq_lens].unsqueeze(1)
+    x_decode = x[b_idx, prefill_inputs.seq_lens].unsqueeze(1)
     with torch.no_grad():
         slotted_packed_prefill = engine.patches.gdn._gdn_forward_slotted(
             gdn,
             x_packed_prefill,
             slotcache=slotcache,
-            slots=prefill_index.slots,
-            prefill_index=prefill_index
+            slots=slots,
+            dest_slot=dest_slot,
+            prefill_inputs=prefill_inputs
         )
         slotted_decode = engine.patches.gdn._gdn_forward_slotted(
             gdn,
             x_decode,
             slotcache=slotcache,
-            slots=prefill_index.slots
+            slots=slots
         )
 
-    slotted_prefills = (slotted_packed_prefill[0, start:end] for start, end in itertools.pairwise(prefill_index.cu_seqlens))
+    slotted_prefills = (slotted_packed_prefill[0, start:end] for start, end in itertools.pairwise(prefill_inputs.cu_seqlens))
     for orig_prefill, slotted_prefill in zip(orig_prefills, slotted_prefills):
         torch.testing.assert_close(orig_prefill, slotted_prefill, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(orig_decode, slotted_decode, atol=2e-2, rtol=2e-2)

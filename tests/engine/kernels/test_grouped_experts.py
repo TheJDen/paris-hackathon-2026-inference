@@ -37,7 +37,7 @@ def test_fb_grouped_experts(experts, T):
     w, idx = torch.randn(T, E, device=device, dtype=torch.bfloat16).softmax(-1).topk(K)
     with torch.no_grad():
         torch.testing.assert_close(
-            engine.kernels.moe_experts.fb_grouped_experts_forward(experts, hidden, idx, w),
+            engine.kernels.moe_experts.fbgemm_grouped_experts_forward(experts, hidden, idx, w),
             experts.forward(hidden, idx, w),
             atol=2e-2,
             rtol=2e-2

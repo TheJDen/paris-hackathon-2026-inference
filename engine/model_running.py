@@ -1,81 +1,100 @@
 import torch
 import tqdm
 
+import engine.batching
 import engine.caching
-from engine.patches.prefill_index import PrefillIndex
+import engine.records
+import engine.sampling
 
 
 class ModelRunner:
-    def __init__(self, model, slotcache: engine.caching.SlotCache):
+    def __init__(self, model, slot_cache: engine.caching.SlotCache, active_sequences: engine.batching.ActiveSequences):
         self.model = model
-        self.slotcache = slotcache
+        self.slot_cache = slot_cache
+        self.active_sequences = active_sequences
         self.graphs = {B: torch.cuda.CUDAGraph() for B in range(1, 65)}
         self.pool = torch.cuda.graph_pool_handle()
-        self.tokens_buffer = torch.zeros(64, 1, dtype=torch.long, device=model.device)
+        self.next_tokens_buffer = torch.zeros(64, 1, dtype=torch.long, device=model.device)
         self.slots_buffer = torch.zeros(64, dtype=torch.int32, device=model.device)
-        self.logits_buffer = torch.empty(64, model.config.vocab_size, dtype=torch.bfloat16, device=model.device)
         self.advance_buffer = torch.ones(64, dtype=torch.int32, device=model.device)
 
-    def prefill(self, input_ids: list[torch.Tensor], slots: list[int]) -> torch.Tensor:
-        lens = [len(x) for x in input_ids]
-        with torch.profiler.record_function("prefill"), torch.inference_mode():
-            prefill_index = PrefillIndex.from_lens_and_slots(lens, slots, device=self.model.device)
-            h_flat = self.model.model(
-                torch.cat([x.to(self.model.device) for x in input_ids]).unsqueeze(0),
-                position_ids=prefill_index.position_ids.unsqueeze(0),
-                slotcache=self.slotcache,
-                slots=prefill_index.slots,
-                prefill_index=prefill_index
-            ).last_hidden_state
-            logits = self.model.lm_head(h_flat[0, prefill_index.cu_seqlens[1:] - 1])
-            self.slotcache.advance(prefill_index.slots, prefill_index.seq_lens)
-        return logits
-
-    def _decode(self, tokens: torch.Tensor, slots: torch.Tensor, advance_lens: torch.Tensor) -> torch.Tensor:
-        h = self.model.model(
-            tokens,
-            slotcache=self.slotcache,
-            position_ids=self.slotcache.lens[slots].unsqueeze(1),
+    def _prefill(
+        self,
+        b: engine.records.PrefillInputs,
+        slots: torch.Tensor
+    ) -> torch.Tensor:
+        h_flat = self.model.model(
+            b.tokens,
+            position_ids=b.position_ids.unsqueeze(0),
+            slotcache=self.slot_cache,
             slots=slots,
+            dest_slot=slots.repeat_interleave(b.seq_lens),
+            prefill_inputs=b
         ).last_hidden_state
-        logits = self.model.lm_head(h[:, -1, :])
-        self.slotcache.advance(slots, advance_lens)
-        return logits
+        logits = self.model.lm_head(h_flat[0, b.cu_seqlens[1:] - 1])
+        next_toks = engine.sampling.sample_next(logits, b.temp, b.top_p)
+        self.slot_cache.begin(slots, b.seq_lens)
+        return next_toks
+
+    def prefill(self) -> torch.Tensor:
+        with torch.profiler.record_function("prefill"), torch.inference_mode():
+            seqs = self.active_sequences.get_prefill_seqs()
+            slots = self.active_sequences.get_prefill_slots()
+            b = engine.records.PrefillInputs.from_seqs(seqs, device=self.model.device)
+            next_toks = self._prefill(b, slots)
+        return next_toks
+
+    def _decode(self, B: int) -> torch.Tensor:
+        slots = self.slots_buffer[:B]
+        with torch.inference_mode():
+            b = self.active_sequences.get_decode_batch(slots)
+            h = self.model.model(
+                b.tokens,
+                slotcache=self.slot_cache,
+                position_ids=self.slot_cache.lens[slots].unsqueeze(1),
+                slots=slots,
+            ).last_hidden_state
+            logits = self.model.lm_head(h[:, -1, :])
+            next_toks = engine.sampling.sample_next(logits, b.temp, b.top_p)
+            self.active_sequences.commit(slots, next_toks)
+            self.slot_cache.advance(slots, self.advance_buffer[:B])
+            self.next_tokens_buffer[:B].copy_(next_toks)
+        return next_toks
 
     def capture(self, B):
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                logits = self._decode(
-                    self.tokens_buffer[:B],
-                    self.slots_buffer[:B],
-                    self.advance_buffer[:B]
-                )
-                self.logits_buffer[:B].copy_(logits)
+                next_toks = self._decode(B)
+                self.next_tokens_buffer[:B].copy_(next_toks)
         torch.cuda.current_stream().wait_stream(s)
         with torch.cuda.graph(self.graphs[B], pool=self.pool):
-            logits = self._decode(
-                self.tokens_buffer[:B],
-                self.slots_buffer[:B],
-                self.advance_buffer[:B]
-            )
-            self.logits_buffer[:B].copy_(logits[:B])
-        self.slotcache.lens[0] = 0 # kinda hacky but we are adults
+            next_toks = self._decode(B)
+            self.next_tokens_buffer[:B].copy_(next_toks)
 
-    def decode(self, tokens: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    def decode(self) -> torch.Tensor:
         with torch.profiler.record_function("decode"), torch.inference_mode():
-            B = tokens.shape[0]
-            self.tokens_buffer[:B].copy_(tokens)
+            slots = self.active_sequences.get_decode_slots()
+            B = slots.shape[0]
             self.slots_buffer[:B].copy_(slots)
             self.graphs[B].replay()
-        return self.logits_buffer[:B]
+        return self.next_tokens_buffer[:B]
 
     def warmup(self):
-        for L in tqdm.tqdm((128, 256, 512, 1024, 2048), desc="Prefill warmup shapes"):
-            slots = [self.slotcache.alloc()]
-            self.prefill([torch.zeros(L, dtype=torch.long, device=self.model.device)], slots)
-            for slot in slots:
-                self.slotcache.release(slot)
+        for L in tqdm.tqdm((64, 128, 256, 512, 1024, 2048), desc="Prefill warmup shapes"):
+            lens = [L // 4, L // 2, L // 4]
+            slots = torch.tensor([1, 3, 7], device=self.model.device)
+            b = engine.records.PrefillInputs.from_tokens(
+                input_ids=[
+                    torch.zeros(n, dtype=torch.long, device=self.model.device)
+                    for n in lens
+                ],
+                temp=torch.zeros(len(lens), device=self.model.device),
+                top_p=torch.ones(len(lens), device=self.model.device),
+                device=self.model.device
+            )
+            self._prefill(b, slots)
         for B in tqdm.tqdm(self.graphs, desc="Decode warmup shapes"):
             self.capture(B)
+

@@ -1,5 +1,5 @@
 import asyncio
-import concurrent
+import concurrent.futures
 import os
 import queue
 import threading
@@ -19,6 +19,7 @@ import engine.model_running
 import engine.patches.attn
 import engine.patches.gdn
 import engine.records
+import engine.scheduling
 
 MAX_CONCURRENT_ACTIVE=64
 MAX_LEN = 2560
@@ -68,21 +69,25 @@ class AsyncEngine:
         if self.batching_mode == "continuous":
             engine.patches.attn.patch_attention()
             engine.patches.gdn.patch_gdn()
-            self.slotcache = engine.caching.SlotCache(
+            slot_cache = engine.caching.SlotCache(
                 model.config,
                 MAX_CONCURRENT_ACTIVE,
                 MAX_LEN,
                 model.device
             )
-            self.model_runner = engine.model_running.ModelRunner(model, self.slotcache)
-            self.batcher = engine.batching.ContinuousBatcher(
+            active_sequences = engine.batching.ActiveSequences(
+                MAX_CONCURRENT_ACTIVE,
+                model.device
+            )
+            self.model_runner = engine.model_running.ModelRunner(model, slot_cache, active_sequences)
+            self.scheduler = engine.scheduling.ContinuousScheduler(
                 self.model_runner,
-                self.slotcache,
+                active_sequences,
                 self.stop_ids,
             )
         else:
-            self.batcher = engine.batching.StaticBatcher(model, self.stop_ids)
-        self.batcher.warmup()
+            self.scheduler = engine.scheduling.StaticScheduler(model, self.stop_ids)
+        self.scheduler.warmup()
         self.ready = True
         self._run_batches()
 
@@ -121,17 +126,17 @@ class AsyncEngine:
 
     def _run_batches(self):
         while True:
-            block = not self.batcher.has_work()
-            items = self.drain_inbox(block=block, window=self.batcher.collect_window)
+            block = not self.scheduler.has_work()
+            items = self.drain_inbox(block=block, window=self.scheduler.collect_window)
             if items is None:
                 break
-            self.batcher.add(items)
+            self.scheduler.add(items)
 
             try:
-                for item, raw_result in self.batcher.step():
+                for item, raw_result in self.scheduler.step():
                     self._set_result_threadsafe(item, raw_result)
             except Exception as exc:
-                for item in self.batcher.abort_items():
+                for item in self.scheduler.abort_items():
                     self._set_exception_threadsafe(item, exc)
 
     def start(self):
@@ -158,6 +163,7 @@ class AsyncEngine:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         item = engine.records.WorkItem(
+            id=request_id,
             req=req,
             future=future,
             loop=loop,

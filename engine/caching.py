@@ -25,8 +25,12 @@ class SlotCache:
         hv = cfg.linear_value_head_dim
         self.conv = {l: torch.empty(num_slots, conv_dim, conv_width, dtype=torch.bfloat16, device=device) for l in gdn}
         self.lens = torch.zeros(num_slots, dtype=torch.int32, device=device)
-        self.free = list(range(num_slots))
-        self.capacity = num_slots
+
+    def begin(self, slots: torch.Tensor, seq_lens: torch.Tensor):
+        self.lens[slots] = seq_lens
+
+    def advance(self, slots: torch.Tensor, seq_lens: torch.Tensor):
+        self.lens[slots] += seq_lens
 
     def read_gdn(self, layer_idx, slots):
         return self.conv[layer_idx][slots], self.rec[layer_idx][slots]
@@ -34,16 +38,3 @@ class SlotCache:
     def update_gdn(self, layer_idx, slots, conv, rec):
         self.conv[layer_idx][slots] = conv.to(self.conv[layer_idx].dtype)
         self.rec[layer_idx][slots] = rec.to(self.rec[layer_idx].dtype)
-
-    def alloc(self) -> int:
-        return self.free.pop()
-
-    def release(self, slot: int):
-        self.lens[slot] = 0
-        self.free.append(slot)
-
-    def num_free_slots(self) -> int:
-        return len(self.free)
-
-    def advance(self, slots: torch.Tensor, seq_lens: torch.Tensor):
-        self.lens[slots] += seq_lens
