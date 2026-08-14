@@ -44,7 +44,7 @@ class ContinuousScheduler:
                 max_tokens=item.req.max_tokens
             )
             self.active_sequences.to_prefill(seq)
-        next_toks = self.model_runner.prefill().squeeze(1)
+        next_toks = self.model_runner.prefill()
         for seq, next_tok in zip(self.active_sequences.get_prefill_seqs(), next_toks.tolist()):
             stop_reason = seq.advance(next_tok)
             if stop_reason is None:
@@ -54,7 +54,7 @@ class ContinuousScheduler:
                 yield seq.item, self._complete(seq, stop_reason)
 
     def _decode(self):
-        next_toks = self.model_runner.decode().squeeze(1)
+        next_toks = self.model_runner.decode()
         for seq, tok in zip(self.active_sequences.get_decode_seqs(), next_toks.tolist()):
             stop_reason = seq.advance(tok)
             if stop_reason is not None:

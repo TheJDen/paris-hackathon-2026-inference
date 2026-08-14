@@ -15,6 +15,8 @@ class ModelRunner:
         self.graphs = {B: torch.cuda.CUDAGraph() for B in range(1, 65)}
         self.pool = torch.cuda.graph_pool_handle()
         self.next_tokens_buffer = torch.zeros(64, 1, dtype=torch.long, device=model.device)
+        self.pinned_tokens = torch.zeros(64, dtype=torch.long, pin_memory=True)
+        self.copy_event = torch.cuda.Event()
         self.advance_buffer = torch.ones(64, dtype=torch.int32, device=model.device)
 
     def _prefill(
@@ -41,7 +43,7 @@ class ModelRunner:
             slots = self.active_sequences.get_prefill_slots()
             b = engine.records.PrefillInputs.from_seqs(seqs, device=self.model.device)
             next_toks = self._prefill(b, slots)
-        return next_toks
+        return next_toks.squeeze(1)
 
     def _decode(self, B: int) -> torch.Tensor:
         with torch.inference_mode():
@@ -76,7 +78,10 @@ class ModelRunner:
         B = self.active_sequences.B
         with torch.profiler.record_function("decode"), torch.inference_mode():
             self.graphs[B].replay()
-        return self.next_tokens_buffer[:B]
+            self.copy_event.record()
+            self.copy_event.synchronize()
+            self.pinned_tokens[:B].copy_(self.next_tokens_buffer[:B, 0], non_blocking=True)
+        return self.pinned_tokens[:B]
 
     def warmup(self):
         for L in tqdm.tqdm((64, 128, 256, 512, 1024, 2048), desc="Prefill warmup shapes"):

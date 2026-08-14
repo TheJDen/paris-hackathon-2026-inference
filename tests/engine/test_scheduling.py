@@ -34,10 +34,10 @@ class FakeRunner:
         self.script = script
     def prefill(self):
         toks = [self.script[s.id].pop(0) for s in self.active.get_prefill_seqs()]
-        return torch.tensor(toks).unsqueeze(1)
+        return torch.tensor(toks)
     def decode(self):
         toks = [self.script[s.id].pop(0) for s in self.active.get_decode_seqs()]
-        return torch.tensor(toks).unsqueeze(1)
+        return torch.tensor(toks)
     def warmup(self):
         pass
 
