@@ -15,7 +15,6 @@ class ModelRunner:
         self.graphs = {B: torch.cuda.CUDAGraph() for B in range(1, 65)}
         self.pool = torch.cuda.graph_pool_handle()
         self.next_tokens_buffer = torch.zeros(64, 1, dtype=torch.long, device=model.device)
-        self.slots_buffer = torch.zeros(64, dtype=torch.int32, device=model.device)
         self.advance_buffer = torch.ones(64, dtype=torch.int32, device=model.device)
 
     def _prefill(
@@ -45,8 +44,8 @@ class ModelRunner:
         return next_toks
 
     def _decode(self, B: int) -> torch.Tensor:
-        slots = self.slots_buffer[:B]
         with torch.inference_mode():
+            slots = self.active_sequences.slots[:B]
             b = self.active_sequences.get_decode_batch(slots)
             h = self.model.model(
                 b.tokens,
@@ -74,10 +73,8 @@ class ModelRunner:
             self.next_tokens_buffer[:B].copy_(next_toks)
 
     def decode(self) -> torch.Tensor:
+        B = self.active_sequences.B
         with torch.profiler.record_function("decode"), torch.inference_mode():
-            slots = self.active_sequences.get_decode_slots()
-            B = slots.shape[0]
-            self.slots_buffer[:B].copy_(slots)
             self.graphs[B].replay()
         return self.next_tokens_buffer[:B]
 
