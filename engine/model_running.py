@@ -3,17 +3,25 @@ import tqdm
 
 import engine.batching
 import engine.caching
+import engine.cuda
 import engine.records
 import engine.sampling
 
 
 class ModelRunner:
-    def __init__(self, model, slot_cache: engine.caching.SlotCache, active_sequences: engine.batching.ActiveSequences):
+    def __init__(
+        self,
+        model,
+        slot_cache: engine.caching.SlotCache,
+        active_sequences: engine.batching.ActiveSequences,
+        eager: bool = False
+    ):
         self.model = model
         self.slot_cache = slot_cache
         self.active_sequences = active_sequences
-        self.graphs = {B: torch.cuda.CUDAGraph() for B in range(1, 65)}
-        self.pool = torch.cuda.graph_pool_handle()
+        self.shapes = list(range(1, 65))
+        self.eager = eager
+        self.graphs = engine.cuda.CudaGraphs(self.shapes)
         self.next_tokens_buffer = torch.zeros(64, 1, dtype=torch.long, device=model.device)
         self.pinned_tokens = torch.zeros(64, dtype=torch.long, pin_memory=True)
         self.copy_event = torch.cuda.Event()
@@ -45,7 +53,7 @@ class ModelRunner:
             next_toks = self._prefill(b, slots)
         return next_toks.squeeze(1)
 
-    def _decode(self, B: int) -> torch.Tensor:
+    def _decode(self, B: int):
         with torch.inference_mode():
             slots = self.active_sequences.slots[:B]
             b = self.active_sequences.get_decode_batch(slots)
@@ -60,32 +68,23 @@ class ModelRunner:
             self.active_sequences.commit(slots, next_toks)
             self.slot_cache.advance(slots, self.advance_buffer[:B])
             self.next_tokens_buffer[:B].copy_(next_toks)
-        return next_toks
-
-    def capture(self, B):
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                next_toks = self._decode(B)
-                self.next_tokens_buffer[:B].copy_(next_toks)
-        torch.cuda.current_stream().wait_stream(s)
-        with torch.cuda.graph(self.graphs[B], pool=self.pool):
-            next_toks = self._decode(B)
-            self.next_tokens_buffer[:B].copy_(next_toks)
 
     def decode(self) -> torch.Tensor:
         B = self.active_sequences.B
-        with torch.profiler.record_function("decode"), torch.inference_mode():
-            self.graphs[B].replay()
-            self.copy_event.record()
-            self.copy_event.synchronize()
-            self.pinned_tokens[:B].copy_(self.next_tokens_buffer[:B, 0], non_blocking=True)
-        return self.pinned_tokens[:B]
+        with torch.profiler.record_function("decode"):
+            if self.eager:
+                self._decode(B)
+            else:
+                self.graphs.replay(B)
+        return self.next_tokens_buffer[:B, 0]
 
     def warmup(self):
-        for L in tqdm.tqdm((64, 128, 256, 512, 1024, 2048), desc="Prefill warmup shapes"):
-            lens = [L // 4, L // 2, L // 4]
+        lens_shapes = [
+            [L // 4, L // 2, L // 4]
+            for L in (64, 128, 256, 512, 1024, 2048)
+        ]
+        lens_shapes.append([17, 33, 15])
+        for lens in tqdm.tqdm(lens_shapes, desc="Prefill warmup shapes"):
             slots = torch.tensor([1, 3, 7], device=self.model.device)
             b = engine.records.PrefillInputs.from_tokens(
                 input_ids=[
@@ -97,6 +96,10 @@ class ModelRunner:
                 device=self.model.device
             )
             self._prefill(b, slots)
-        for B in tqdm.tqdm(self.graphs, desc="Decode warmup shapes"):
-            self.capture(B)
+        for B in tqdm.tqdm(self.shapes, desc="Decode warmup shapes"):
+            if self.eager:
+                self._decode(B)
+            else:
+                self.graphs.capture(B, lambda B=B: self._decode(B))
+
 

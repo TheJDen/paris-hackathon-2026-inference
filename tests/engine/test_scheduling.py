@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import engine.batching
+import engine.cuda
 import engine.protocols
 import engine.records
 import engine.scheduling
@@ -32,11 +33,14 @@ class FakeRunner:
     ):
         self.active = active
         self.script = script
+        self.i = 0
     def prefill(self):
-        toks = [self.script[s.id].pop(0) for s in self.active.get_prefill_seqs()]
+        toks = [self.script[s.id][min(self.i, len(self.script[s.id]) - 1)] for s in self.active.get_prefill_seqs()]
+        self.i += 1
         return torch.tensor(toks)
     def decode(self):
-        toks = [self.script[s.id].pop(0) for s in self.active.get_decode_seqs()]
+        toks = [self.script[s.id][min(self.i, len(self.script[s.id]) - 1)] for s in self.active.get_decode_seqs()]
+        self.i += 1
         return torch.tensor(toks)
     def warmup(self):
         pass
@@ -49,10 +53,20 @@ mock_t = tuple[
 
 @pytest.fixture
 def mock_factory():
-    def factory(script, num_slots, stop_ids={STOP_ID}):
+    def factory(script, num_slots, depth=2, stop_ids={STOP_ID}):
         active_seqs = engine.batching.ActiveSequences(num_slots)
         runner = FakeRunner(active_seqs, script)
-        scheduler = engine.scheduling.ContinuousScheduler(runner, active_seqs, set(stop_ids))
+        executor = engine.cuda.EventExecutor(
+            num_events=depth, 
+            out_capacity=num_slots,
+            dtype=torch.long
+        )
+        scheduler = engine.scheduling.ContinuousScheduler(
+            runner,
+            active_seqs,
+            executor,
+            set(stop_ids)
+        )
         return scheduler, active_seqs
     return factory
 
@@ -102,3 +116,16 @@ def test_length_stops(mock_factory):
     scheduler.add(items)
     z = next(res for i, res in drain(scheduler, 5))
     assert z.finish_reason == "length" and len(z.generated) == 3
+
+def test_depth1_equals_depth2(mock_factory):                    # the core pipelining guarantee
+    script = {
+        "a": [11, 12, 13, STOP_ID],
+        "b": [21, 22, 23, 24, 25, STOP_ID],
+        "c": [31, STOP_ID]
+    }
+    def gens(depth):
+        scheduler, _ = mock_factory({k: list(v) for k, v in script.items()}, num_slots=8, depth=depth)
+        items = [make_item(rid) for rid in "ab"]
+        scheduler.add(items)
+        return {item.id: res for item, res in drain(scheduler, 6)}
+    return gens(1) == gens(2)

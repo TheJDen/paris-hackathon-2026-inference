@@ -4,6 +4,7 @@ import torch
 
 import engine.batching
 import engine.caching
+import engine.cuda
 import engine.protocols
 import engine.records
 import engine.sampling
@@ -15,12 +16,15 @@ class ContinuousScheduler:
         self,
         model_runner: engine.protocols.ModelRunner,
         active_sequences: engine.batching.ActiveSequences,
+        executor: engine.cuda.EventExecutor,
         stop_ids: set[int],
     ):
         self.model_runner = model_runner
         self.active_sequences = active_sequences
         self.stop_ids = stop_ids
         self.waiting = collections.deque()
+        self.executor = executor
+        self.queue = collections.deque(maxlen=self.executor.n)
 
     def add(self, items: list[engine.records.WorkItem]):
         self.waiting.extend(items)
@@ -29,11 +33,11 @@ class ContinuousScheduler:
         prefill_items = [self.waiting.popleft() for _ in range(min(len(self.waiting), self.active_sequences.num_free()))]
         if prefill_items:
             yield from self._prefill(prefill_items)
-        if self.active_sequences:
+        if self.active_sequences or self.queue:
             yield from self._decode()
 
     def has_work(self):
-        return bool(self.waiting or len(self.active_sequences))
+        return bool(self.waiting or len(self.active_sequences) or self.queue)
 
     def _prefill(self, items: list[engine.records.WorkItem]):
         for item in items:
@@ -54,8 +58,20 @@ class ContinuousScheduler:
                 yield seq.item, self._complete(seq, stop_reason)
 
     def _decode(self):
-        next_toks = self.model_runner.decode()
-        for seq, tok in zip(self.active_sequences.get_decode_seqs(), next_toks.tolist()):
+        while len(self.queue) < self.executor.n:
+            B = self.active_sequences.B
+            if B == 0:
+                break
+            seqs = self.active_sequences.get_decode_seqs()
+            future = self.executor.submit(self.model_runner.decode)
+            self.queue.append((future, seqs))
+        if not self.queue:
+            return
+        fut, seqs = self.queue.popleft()
+        next_toks = fut.result()
+        for seq, tok in zip(seqs, next_toks.tolist()):
+            if seq.finished:
+                continue
             stop_reason = seq.advance(tok)
             if stop_reason is not None:
                 item = seq.item
@@ -80,6 +96,7 @@ class ContinuousScheduler:
         for seq in seqs:
             self.active_sequences.remove(seq.id)
             items.append(seq.item)
+        self.queue.clear()
         return items
 
     def warmup(self):

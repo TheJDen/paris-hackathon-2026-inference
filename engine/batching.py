@@ -14,6 +14,7 @@ class ActiveSequences:
         self.index_of = {}
         self.prefilling = {}
         self.decoding = [None] * capacity
+        self.capacity = capacity
 
     def to_prefill(self, seq: engine.records.SeqState):
         self.prefilling[seq.id] = seq, self.free.pop()

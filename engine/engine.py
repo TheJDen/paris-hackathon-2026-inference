@@ -13,6 +13,7 @@ import transformers.integrations.moe
 
 import engine.batching
 import engine.caching
+import engine.cuda
 import engine.kernels.moe_experts
 import engine.loading
 import engine.model_running
@@ -21,8 +22,9 @@ import engine.patches.gdn
 import engine.records
 import engine.scheduling
 
-MAX_CONCURRENT_ACTIVE=64
+MAX_CONCURRENT_ACTIVE = 64
 MAX_LEN = 2560
+PIPELINE_DEPTH = int(os.environ.get("PIPELINE_DEPTH", "2"))
 
 class AsyncEngine:
     def __init__(self, max_queue_size=1024, load_fn=engine.loading.load):
@@ -35,6 +37,7 @@ class AsyncEngine:
         self.ready = False
         self.load_fn = load_fn
         self.batching_mode = os.environ.get("BATCHING_MODE", "continuous")
+        self.eager = os.environ.get("GRAPH_MODE", "capture") == "eager"
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(engine.loading.MODEL_ID)
         self._tok_pool = ThreadPoolExecutor(max_workers=4)
         self.stop_ids = {self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|im_end|>")}
@@ -79,10 +82,21 @@ class AsyncEngine:
                 MAX_CONCURRENT_ACTIVE,
                 model.device
             )
-            self.model_runner = engine.model_running.ModelRunner(model, slot_cache, active_sequences)
-            self.scheduler = engine.scheduling.ContinuousScheduler(
-                self.model_runner,
+            model_runner = engine.model_running.ModelRunner(
+                model,
+                slot_cache,
                 active_sequences,
+                self.eager
+            )
+            executor = engine.cuda.EventExecutor(
+                num_events=PIPELINE_DEPTH,
+                out_capacity=MAX_CONCURRENT_ACTIVE,
+                dtype=torch.long,
+            )
+            self.scheduler = engine.scheduling.ContinuousScheduler(
+                model_runner,
+                active_sequences,
+                executor,
                 self.stop_ids,
             )
         else:

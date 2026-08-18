@@ -42,12 +42,17 @@ class SeqState:
     max_tokens: int
     prompt_len: int
     generated: list[int] = dataclasses.field(default_factory=list)
+    finished: bool = False
 
     def advance(self, tok: int) -> str | None:
         if tok in self.stop_ids:
+            self.finished = True
             return "stop"
         self.generated.append(tok)
-        return "length" if len(self.generated) >= self.max_tokens else None
+        if len(self.generated) >= self.max_tokens:
+            self.finished = True
+            return "length"
+        return None
 
     @property
     def id(self) -> str:
