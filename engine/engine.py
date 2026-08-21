@@ -67,8 +67,9 @@ class AsyncEngine:
 
     def _engine_main(self):
         self.model = model = self.load_fn()
-        transformers.integrations.moe.ExpertsInterface.register("triton_grouped", engine.kernels.moe_experts.fbgemm_grouped_experts_forward)
-        self.model.config._experts_implementation = "triton_grouped"
+        transformers.integrations.moe.ExpertsInterface.register("fbgemm", engine.kernels.moe_experts.fbgemm_grouped_experts_forward)
+        transformers.integrations.moe.ExpertsInterface.register("woct", engine.kernels.moe_experts.grouped_experts_forward)
+        self.model.config._experts_implementation = "woct"
         if self.batching_mode == "continuous":
             engine.patches.attn.patch_attention()
             engine.patches.gdn.patch_gdn()

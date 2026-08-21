@@ -16,14 +16,24 @@ def grouped_experts_forward(
     order = flat_index.argsort()
     token_idx = torch.arange(T, device=hidden_states.device).repeat_interleave(K)
     rows = hidden_states[token_idx[order]]
-    offs = torch.bincount(flat_index, minlength=self.num_experts).cumsum(0).int()
-    gate_and_up = engine.kernels.grouped_gemm.grouped_gemm_forward(rows, self.gate_up_proj, offs)
+    # scatter add promises static shape compared to torch.bincount
+    # offs= torch.bincount(flat_index, minlength=self.num_experts).cumsum(0).int()
+    m_sizes = torch.zeros(self.num_experts, dtype=torch.int64, device=hidden_states.device)
+    m_sizes.scatter_add_(0, flat_index, torch.ones_like(flat_index))
+    offs = m_sizes.cumsum(0).int()
+    gate_and_up = engine.kernels.grouped_gemm.grouped_gemm_forward(rows, self.gate_up_proj, offs, T)
     gate, up = gate_and_up.chunk(2, -1)
-    h = self.act_fn(gate) * up
-    out = engine.kernels.grouped_gemm.grouped_gemm_forward(h, self.down_proj, offs)
-    out = out * top_k_weights.reshape(-1)[order, None]
+    h = self.act_fn(gate) * up * top_k_weights.reshape(-1)[order, None]
     final = torch.zeros_like(hidden_states)
-    final.index_add_(0, token_idx[order], out)
+    engine.kernels.grouped_gemm.grouped_gemm_forward(
+        h,
+        self.down_proj,
+        offs,
+        T,
+        _out=final,
+        _scatter_indices=token_idx[order]
+
+    )
     return final
 
 def fbgemm_grouped_experts_forward(

@@ -4,6 +4,8 @@
 # path: qwen3_moe_fused/grouped_gemm/non_persistent/forward.py @ 10c7309
 # Modifications: import paths adjusted for engine.kernels and helper functions
 # exceeds_smem_capacity and is_int_tensor inlined
+# removed host sync and opted for static launch grid
+# added fused scatter add to reduce peak mem in CUDA Graph pool
 
 # y[m, n] = sum_k w[s[m], n, k] * x[m, k]
 
@@ -56,6 +58,7 @@ def is_int_tensor(x: torch.Tensor) -> bool:
     key=get_autotune_keys(),
     prune_configs_by={"early_config_prune": partial(prune_configs, exceeds_smem_capacity)},
     cache_results=True,
+    restore_value=["y_ptr"]
 )
 @triton.jit
 def _grouped_gemm_forward_kernel(
@@ -64,6 +67,7 @@ def _grouped_gemm_forward_kernel(
     w_ptr,
     m_offsets_ptr,
     y_ptr,
+    scatter_indices_ptr,
     # Dimensions
     M: int,
     N: tl.constexpr,
@@ -78,6 +82,7 @@ def _grouped_gemm_forward_kernel(
     stride_ym: tl.constexpr,
     stride_yn: tl.constexpr,
     # Metadata
+    FUSE_SCATTER_ADD: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr = 64,
     BLOCK_SIZE_N: tl.constexpr = 64,
     BLOCK_SIZE_K: tl.constexpr = 64,
@@ -122,12 +127,29 @@ def _grouped_gemm_forward_kernel(
         w_ptrs += stride_wk * BLOCK_SIZE_K
 
     y = accumulator.to(y_ptr.dtype.element_ty)
-    y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
-    tl.store(y_ptrs, y, mask=mask_m[:, None] & mask_n[None, :])
+    if FUSE_SCATTER_ADD:
+        # To achieve fused scatter add, we must use atomic add to prevent race
+        dest = tl.load(scatter_indices_ptr + offs_m, mask=mask_m, other=0)
+        tl.atomic_add(
+            y_ptr + dest[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+            y,
+            mask=mask_m[:, None] & mask_n[None, :],
+            sem="relaxed"
+        )
+    else:
+        y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
+        tl.store(y_ptrs, y, mask=mask_m[:, None] & mask_n[None, :])
 
 
 def grouped_gemm_forward(
-    x: torch.Tensor, w: torch.Tensor, m_offsets: torch.Tensor, dtype: Optional[torch.dtype] = None
+    x: torch.Tensor,
+    w: torch.Tensor,
+    m_offsets: torch.Tensor,
+    max_group_size: int,
+    *,
+    _out: torch.Tensor | None = None,
+    _scatter_indices: torch.Tensor | None = None,
+    dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     assert x.is_cuda
     assert w.device == x.device
@@ -141,30 +163,26 @@ def grouped_gemm_forward(
     assert m_offsets.ndim == 1
     M, _ = x.shape
     E, N, K = w.shape
+    T = max_group_size
     assert x.shape[1] == K
     assert m_offsets.numel() == E
 
     if dtype is None:
         dtype = x.dtype
-    y = torch.empty((M, N), device=x.device, dtype=dtype)
-
-    # Compute grid dimensions
-    # We need the maximum m_size to size the grid efficiently.
-    # Note: .item() causes a host-device sync
-    # We can compute m_sizes from m_offsets for this
-    m_sizes = torch.empty_like(m_offsets)
-    m_sizes[0] = m_offsets[0]
-    m_sizes[1:] = m_offsets[1:] - m_offsets[:-1]
-    max_m = m_sizes.max().item()
 
     def grid(META):
         bm = META["BLOCK_SIZE_M"]
         bn = META["BLOCK_SIZE_N"]
-        max_m_blocks = triton.cdiv(max_m, bm)
+        max_m_blocks = triton.cdiv(T, bm)
         num_n_tiles = triton.cdiv(N, bn)
         # Grid: (Max Tiles per Expert, Number of Experts)
         return (max_m_blocks * num_n_tiles, E)
-
+    FUSE_SCATTER_ADD = _out is not None
+    if FUSE_SCATTER_ADD:
+        assert _scatter_indices is not None
+        y = _out
+    else:
+        y = torch.empty((M, N), device=x.device, dtype=dtype or x.dtype)
     with torch.cuda.device(x.device):
         _grouped_gemm_forward_kernel[grid](
             # Pointers
@@ -172,6 +190,7 @@ def grouped_gemm_forward(
             w,
             m_offsets,
             y,
+            _scatter_indices,
             # Dimensions
             M,
             N,
@@ -185,5 +204,6 @@ def grouped_gemm_forward(
             w.stride(2),
             y.stride(0),
             y.stride(1),
+            FUSE_SCATTER_ADD=_scatter_indices is not None
         )
     return y
