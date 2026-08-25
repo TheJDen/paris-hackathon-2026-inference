@@ -38,7 +38,8 @@ class ModelRunner:
             slotcache=self.slot_cache,
             slots=slots,
             dest_slot=slots.repeat_interleave(b.seq_lens),
-            prefill_inputs=b
+            prefill_inputs=b,
+            mode="prefill"
         ).last_hidden_state
         logits = self.model.lm_head(h_flat[0, b.cu_seqlens[1:] - 1])
         next_toks = engine.sampling.sample_next(logits, b.temp, b.top_p)
@@ -62,6 +63,7 @@ class ModelRunner:
                 slotcache=self.slot_cache,
                 position_ids=self.slot_cache.lens[slots].unsqueeze(1),
                 slots=slots,
+                mode="decode"
             ).last_hidden_state
             logits = self.model.lm_head(h[:, -1, :])
             next_toks = engine.sampling.sample_next(logits, b.temp, b.top_p)

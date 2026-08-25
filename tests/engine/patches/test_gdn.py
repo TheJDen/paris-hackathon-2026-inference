@@ -59,13 +59,15 @@ def test_gdn(cfg, gdn, lens):
             slotcache=slotcache,
             slots=slots,
             dest_slot=dest_slot,
-            prefill_inputs=prefill_inputs
+            prefill_inputs=prefill_inputs,
+            mode="prefill"
         )
         slotted_decode = engine.patches.gdn._gdn_forward_slotted(
             gdn,
             x_decode,
             slotcache=slotcache,
-            slots=slots
+            slots=slots,
+            mode="decode"
         )
 
     slotted_prefills = (slotted_packed_prefill[0, start:end] for start, end in itertools.pairwise(prefill_inputs.cu_seqlens))
