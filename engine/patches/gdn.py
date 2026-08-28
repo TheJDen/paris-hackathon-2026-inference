@@ -6,7 +6,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     apply_mask_to_padding_states,
 )
 
-from engine.caching import SlotCache
+from engine.caching import GDNCheckpointer, SlotCache
 from engine.records import PrefillInputs
 
 
@@ -129,9 +129,58 @@ def prefill(
     slotcache.update_gdn(self.layer_idx, slots, conv, last_recurrent_state)
     return core_attn_out
 
+def verify(
+    self,
+    mixed_qkv,
+    a,
+    b,
+    batch_size,
+    seq_len,
+    *,
+    slotcache: SlotCache,
+    slots: torch.Tensor,
+    checkpointer: GDNCheckpointer,
+    **_
+):
+    conv, rec = slotcache.read_gdn(self.layer_idx, slots)
+    outs = []
+    for i in range(seq_len):
+        # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
+        mixed_qkv_i = self.causal_conv1d_update(
+            mixed_qkv[:, :, i:i+1],
+            conv,
+            self.conv1d.weight.squeeze(1),
+            self.conv1d.bias,
+            self.activation,
+        )
+
+        query, key, value, beta, g = qkv_beta_g(
+            self,
+            mixed_qkv_i,
+            a[:, i:i+1],
+            b[:, i:i+1],
+            batch_size,
+            1
+        )
+
+        core_attn_out, rec = self.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=rec,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        checkpointer.save(self.layer_idx, slots, i, conv, rec)
+        outs.append(core_attn_out)
+    return torch.cat(outs, dim=1)
+
 _CORE_ATTN = {
     "decode": decode,
-    "prefill": prefill
+    "prefill": prefill,
+    "verify": verify
 }
 
 def _gdn_forward_slotted(

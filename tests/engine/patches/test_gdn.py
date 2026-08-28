@@ -22,7 +22,7 @@ def gdn(cfg):
     return attn
 
 @pytest.mark.parametrize("lens", [[3, 7, 5], [16, 1, 9, 4]])
-def test_gdn(cfg, gdn, lens):
+def test_gdn_prefill_decode(cfg, gdn, lens):
     torch.manual_seed(42)
     B, maxL, H = len(lens), max(lens), cfg.hidden_size
 
@@ -74,3 +74,89 @@ def test_gdn(cfg, gdn, lens):
     for orig_prefill, slotted_prefill in zip(orig_prefills, slotted_prefills):
         torch.testing.assert_close(orig_prefill, slotted_prefill, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(orig_decode, slotted_decode, atol=2e-2, rtol=2e-2)
+
+@pytest.mark.parametrize("k,n", [(k, n) for k in (1, 2, 3) for n in range(k + 1)])
+def test_gdn_verify(cfg, gdn, k, n):
+    L = gdn.layer_idx
+    H = cfg.hidden_size
+    MAX_LENGTH = 20
+    slotcache = engine.caching.SlotCache(
+        cfg,
+        num_slots=8,
+        max_len=MAX_LENGTH,
+        device=device
+    )
+    checkpointer = engine.caching.GDNCheckpointer(slotcache, k)
+    decode_slot, verify_slot = torch.tensor([0], device=device), torch.tensor([1], device=device)
+
+    warm = [torch.randn((1, 1, H), dtype=torch.bfloat16, device=device) for _ in range(3)]
+    body = [torch.randn((1, 1, H), dtype=torch.bfloat16, device=device) for _ in range(k + 1)]
+    cont = [torch.randn((1, 1, H), dtype=torch.bfloat16, device=device) for _ in range(3)]
+
+    dconv, drec = slotcache.read_gdn(L, decode_slot)
+    vconv, vrec = slotcache.read_gdn(L, verify_slot)
+
+    slotcache.update_gdn(L, decode_slot, torch.zeros_like(dconv), torch.zeros_like(drec))
+    slotcache.update_gdn(L, verify_slot, torch.zeros_like(vconv), torch.zeros_like(vrec))
+    with torch.no_grad():
+        for t in warm:
+            engine.patches.gdn._gdn_forward_slotted(
+                gdn,
+                t,
+                slotcache=slotcache,
+                slots=decode_slot,
+                mode="decode"
+            )
+            engine.patches.gdn._gdn_forward_slotted(
+                gdn,
+                t,
+                slotcache=slotcache,
+                slots=verify_slot,
+                mode="decode"
+            )
+
+        for t in body[:n + 1]:
+            engine.patches.gdn._gdn_forward_slotted(
+                gdn,
+                t,
+                slotcache=slotcache,
+                slots=decode_slot,
+                mode="decode"
+            )
+
+
+        engine.patches.gdn._gdn_forward_slotted(
+            gdn,
+            torch.cat(body, dim=1),
+            slotcache=slotcache,
+            slots=verify_slot,
+            mode="verify",
+            checkpointer=checkpointer,
+            spec_k=k
+        )
+        checkpointer.promote(verify_slot, n)
+
+        decode_cont = []
+        verify_cont = []
+        for t in cont:
+            decode_cont.append(engine.patches.gdn._gdn_forward_slotted(
+                gdn,
+                t,
+                slotcache=slotcache,
+                slots=decode_slot,
+                mode="decode"
+            ))
+            verify_cont.append(engine.patches.gdn._gdn_forward_slotted(
+                gdn,
+                t,
+                slotcache=slotcache,
+                slots=verify_slot,
+                mode="decode"
+            ))
+
+    torch.testing.assert_close(
+        torch.cat(decode_cont, dim=1),
+        torch.cat(verify_cont, dim=1),
+        rtol=2e-2,
+        atol=2e-2
+    )

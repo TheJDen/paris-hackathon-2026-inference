@@ -38,3 +38,19 @@ class SlotCache:
     def update_gdn(self, layer_idx, slots, conv, rec):
         self.conv[layer_idx][slots] = conv.to(self.conv[layer_idx].dtype)
         self.rec[layer_idx][slots] = rec.to(self.rec[layer_idx].dtype)
+
+class GDNCheckpointer:
+    def __init__(self, slotcache: SlotCache, k: int):
+        self.slotcache = slotcache
+        self.conv = {l: torch.empty(k + 1, *c.shape, dtype=c.dtype, device=c.device) for l, c in slotcache.conv.items()}
+        self.rec = {l: torch.empty(k + 1, *r.shape, dtype=r.dtype, device=r.device) for l, r in slotcache.rec.items()}
+        self.k = k
+
+    def save(self, layer_idx, slots, i, conv, rec):
+        self.conv[layer_idx][i, slots] = conv.to(self.conv[layer_idx].dtype)
+        self.rec[layer_idx][i, slots] = rec.to(self.rec[layer_idx].dtype)
+
+    def promote(self, slots, i):
+        for layer_idx in self.conv:
+            conv, rec = self.conv[layer_idx][i, slots], self.rec[layer_idx][i, slots]
+            self.slotcache.update_gdn(layer_idx, slots,  conv, rec)
